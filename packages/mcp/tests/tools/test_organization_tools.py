@@ -1,0 +1,199 @@
+"""Tests for organization MCP tools (mocked PipefyClient)."""
+
+from datetime import timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from _mcp_compat import (
+    create_connected_server_and_client_session as create_client_session,
+)
+from pipefy_sdk import PipefyClient, PipefyGraphQLError
+
+from pipefy_mcp.core.tool_error_envelope import tool_error_message
+from pipefy_mcp.tools.organization_tools import OrganizationTools
+from tools.conftest import build_tool_test_server
+
+
+@pytest.fixture
+def mock_org_client():
+    client = MagicMock(PipefyClient)
+    client.get_organization = AsyncMock()
+    client.list_organizations = AsyncMock()
+    return client
+
+
+@pytest.fixture
+def org_mcp_server(mock_org_client):
+    return build_tool_test_server(
+        "Pipefy Organization Tools Test",
+        OrganizationTools.register,
+        mock_org_client,
+    )
+
+
+@pytest.fixture
+def org_session(org_mcp_server, request):
+    elicitation = getattr(request, "param", None)
+    return create_client_session(
+        org_mcp_server,
+        read_timeout_seconds=timedelta(seconds=10),
+        raise_exceptions=True,
+        elicitation_callback=elicitation,
+    )
+
+
+@pytest.mark.anyio
+async def test_get_organization_success(org_session, mock_org_client, extract_payload):
+    mock_org_client.get_organization = AsyncMock(
+        return_value={
+            "id": "123",
+            "uuid": "abc-def",
+            "name": "My Org",
+            "planName": "Business",
+            "membersCount": 42,
+        }
+    )
+    async with org_session as session:
+        result = await session.call_tool("get_organization", {"organization_id": "123"})
+    assert result.is_error is False
+    mock_org_client.get_organization.assert_awaited_once_with("123")
+    payload = extract_payload(result)
+    assert payload["success"] is True
+    assert "My Org" in payload["result"]
+    assert payload["data"]["name"] == "My Org"
+
+
+@pytest.mark.anyio
+async def test_get_organization_not_found_returns_error(
+    org_session, mock_org_client, extract_payload
+):
+    mock_org_client.get_organization = AsyncMock(
+        side_effect=ValueError("Organization '999' was not found.")
+    )
+    async with org_session as session:
+        result = await session.call_tool("get_organization", {"organization_id": "999"})
+    assert result.is_error is False
+    payload = extract_payload(result)
+    assert payload["success"] is False
+    assert "not found" in tool_error_message(payload).lower()
+
+
+@pytest.mark.anyio
+async def test_get_organization_transport_error(
+    org_session, mock_org_client, extract_payload
+):
+    mock_org_client.get_organization = AsyncMock(
+        side_effect=PipefyGraphQLError([{"message": "timeout"}])
+    )
+    async with org_session as session:
+        result = await session.call_tool("get_organization", {"organization_id": "123"})
+    assert result.is_error is False
+    payload = extract_payload(result)
+    assert payload["success"] is False
+    err = payload.get("error")
+    assert isinstance(err, dict) and "message" in err
+
+
+@pytest.mark.anyio
+async def test_list_organizations_success(
+    org_session, mock_org_client, extract_payload
+):
+    mock_org_client.list_organizations = AsyncMock(
+        return_value=[
+            {"id": "123", "uuid": "abc", "name": "My Org", "role": "admin"},
+            {"id": "456", "uuid": "def", "name": "Other Org", "role": "member"},
+        ]
+    )
+    async with org_session as session:
+        result = await session.call_tool("list_organizations", {})
+    assert result.is_error is False
+    mock_org_client.list_organizations.assert_awaited_once_with()
+    payload = extract_payload(result)
+    assert payload["success"] is True
+    assert "My Org" in payload["result"]
+    assert [o["name"] for o in payload["data"]["organizations"]] == [
+        "My Org",
+        "Other Org",
+    ]
+
+
+@pytest.mark.anyio
+async def test_list_organizations_empty(org_session, mock_org_client, extract_payload):
+    mock_org_client.list_organizations = AsyncMock(return_value=[])
+    async with org_session as session:
+        result = await session.call_tool("list_organizations", {})
+    assert result.is_error is False
+    payload = extract_payload(result)
+    assert payload["success"] is True
+    assert payload["data"]["organizations"] == []
+
+
+@pytest.mark.anyio
+async def test_list_organizations_transport_error(
+    org_session, mock_org_client, extract_payload
+):
+    mock_org_client.list_organizations = AsyncMock(
+        side_effect=PipefyGraphQLError([{"message": "timeout"}])
+    )
+    async with org_session as session:
+        result = await session.call_tool("list_organizations", {})
+    assert result.is_error is False
+    payload = extract_payload(result)
+    assert payload["success"] is False
+    err = payload.get("error")
+    assert isinstance(err, dict) and "message" in err
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("exc_message", ["", "   "])
+async def test_list_organizations_empty_exception_message_uses_fallback(
+    org_session, mock_org_client, extract_payload, exc_message
+):
+    mock_org_client.list_organizations = AsyncMock(
+        side_effect=RuntimeError(exc_message)
+    )
+    async with org_session as session:
+        result = await session.call_tool("list_organizations", {})
+    payload = extract_payload(result)
+    assert payload["success"] is False
+    message = tool_error_message(payload)
+    assert message == "Organization request failed."
+    assert "do not blind-retry" not in message
+
+
+@pytest.mark.anyio
+async def test_list_organizations_preserves_non_empty_exception_message(
+    org_session, mock_org_client, extract_payload
+):
+    mock_org_client.list_organizations = AsyncMock(side_effect=RuntimeError("org boom"))
+    async with org_session as session:
+        result = await session.call_tool("list_organizations", {})
+    payload = extract_payload(result)
+    assert payload["success"] is False
+    assert "org boom" in tool_error_message(payload)
+
+
+## ---------------------------------------------------------------------------
+## PipefyId coercion: int → str through MCP transport (mcporter mitigation)
+## ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_get_organization_coerces_int_organization_id(
+    org_session, mock_org_client, extract_payload
+):
+    mock_org_client.get_organization = AsyncMock(
+        return_value={
+            "id": "123",
+            "uuid": "abc-def",
+            "name": "My Org",
+            "planName": "Business",
+            "membersCount": 42,
+        }
+    )
+    async with org_session as session:
+        result = await session.call_tool("get_organization", {"organization_id": 123})
+    assert result.is_error is False
+    mock_org_client.get_organization.assert_awaited_once_with("123")
+    payload = extract_payload(result)
+    assert payload["success"] is True

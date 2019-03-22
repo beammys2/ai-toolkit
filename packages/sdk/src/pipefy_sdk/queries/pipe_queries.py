@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+from gql import gql
+
+GET_PIPE_QUERY = gql(
+    """
+    query ($pipe_id: ID!) {
+        pipe(id: $pipe_id) {
+            id
+            uuid
+            name
+            startFormPhaseId
+            phases {
+                id
+                name
+                cards_count
+                fields {
+                    id
+                    internal_id
+                }
+            }
+            labels {
+                id
+                name
+            }
+            start_form_fields {
+                id
+                internal_id
+                label
+                required
+                type
+                options
+            }
+        }
+    }
+    """
+)
+
+GET_START_FORM_FIELDS_QUERY = gql(
+    """
+    query ($pipe_id: ID!) {
+        pipe(id: $pipe_id) {
+            start_form_fields {
+                id
+                internal_id
+                label
+                type
+                required
+                editable
+                options
+                description
+                help
+            }
+        }
+    }
+    """
+)
+
+SEARCH_PIPES_QUERY = gql(
+    """
+    query SearchPipes($nameSearch: String) {
+        organizations {
+            id
+            name
+            pipesCount
+            pipes(name_search: $nameSearch) {
+                id
+                name
+                description
+            }
+        }
+    }
+    """
+)
+
+GET_PIPE_MEMBERS_QUERY = gql(
+    """
+    query GetPipeMembers($pipeId: ID!) {
+        pipe(id: $pipeId) {
+            members {
+                user {
+                    id
+                    uuid
+                    name
+                    email
+                }
+                role_name
+            }
+        }
+    }
+    """
+)
+
+GET_PHASE_ALLOWED_MOVES_QUERY = gql(
+    """
+    query GetPhaseAllowedMoves($phase_id: ID!) {
+        phase(id: $phase_id) {
+            id
+            name
+            cards_can_be_moved_to_phases {
+                id
+                name
+            }
+        }
+    }
+    """
+)
+
+GET_PHASE_FIELDS_QUERY = gql(
+    """
+    query GetPhaseFields($phase_id: ID!) {
+        phase(id: $phase_id) {
+            id
+            name
+            fields {
+                id
+                internal_id
+                uuid
+                label
+                type
+                required
+                editable
+                options
+                description
+                help
+            }
+        }
+    }
+    """
+)
+
+GET_PHASE_QUERY = gql(
+    """
+    query GetPhase($phase_id: ID!) {
+        phase(id: $phase_id) {
+            id
+            name
+            cards_count
+        }
+    }
+    """
+)
+
+GET_PHASE_CARDS_QUERY = gql(
+    """
+    query GetPhaseCards(
+        $phase_id: ID!,
+        $first: Int,
+        $after: String,
+        $includeFields: Boolean!
+    ) {
+        phase(id: $phase_id) {
+            id
+            cards(first: $first, after: $after) {
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+                edges {
+                    node {
+                        id
+                        title
+                        fields @include(if: $includeFields) {
+                            name
+                            value
+                        }
+                    }
+                }
+                totalCount
+            }
+        }
+    }
+    """
+)
+
+GET_PIPE_WITH_PREFERENCES_QUERY = gql(
+    """
+    query ($pipe_id: ID!) {
+        pipe(id: $pipe_id) {
+            id
+            uuid
+            name
+            organizationId
+            preferences {
+                aiAgentsEnabled
+            }
+            phases {
+                id
+                name
+                fields {
+                    id
+                    internal_id
+                    label
+                    type
+                    editable
+                }
+            }
+            start_form_fields {
+                id
+                internal_id
+                label
+                type
+                editable
+            }
+        }
+    }
+    """
+)
+
+__all__ = [
+    "GET_PHASE_ALLOWED_MOVES_QUERY",
+    "GET_PHASE_QUERY",
+    "GET_PHASE_CARDS_QUERY",
+    "GET_PHASE_FIELDS_QUERY",
+    "GET_PIPE_MEMBERS_QUERY",
+    "GET_PIPE_QUERY",
+    "GET_PIPE_WITH_PREFERENCES_QUERY",
+    "GET_START_FORM_FIELDS_QUERY",
+    "SEARCH_PIPES_QUERY",
+]

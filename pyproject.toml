@@ -1,0 +1,79 @@
+[project]
+name = "pipefy-workspace"
+version = "0.5.2-beta.1"
+description = "Development workspace for Pipefy MCP server, SDK, and CLI (not published as a single distribution)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/sdk", "packages/mcp", "packages/cli", "packages/auth", "packages/infra"]
+
+[tool.uv.sources]
+pipefy = { workspace = true }
+pipefy-mcp-server = { workspace = true }
+pipefy-cli = { workspace = true }
+pipefy-auth = { workspace = true }
+pipefy-infra = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pipefy",
+    "pipefy-mcp-server",
+    "pipefy-cli",
+    "pipefy-auth",
+    "pipefy-infra",
+    "aiohttp>=3.11.16",
+    "import-linter>=2.1",
+    "packaging>=24",
+    "pytest>=8.3.5",
+    "pytest-asyncio>=0.26.0",
+    "pytest-cov>=6.1.1",
+    "pytest-mock>=3.14.0",
+    "respx>=0.22.0",
+    "ruff>=0.11.4",
+]
+
+[tool.ruff]
+lint.extend-select = ["I", "S101"]
+lint.per-file-ignores = { "**/tests/**" = ["S101"] }
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "packages/sdk/tests", "packages/mcp/tests", "packages/cli/tests", "packages/auth/tests", "packages/infra/tests"]
+pythonpath = [
+    "packages/mcp/tests",
+    "packages/sdk/tests",
+    "packages/cli/src",
+    "packages/cli/tests",
+    "packages/auth/src",
+    "packages/auth/tests",
+    "packages/infra/src",
+    "packages/infra/tests",
+]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --no-header --tb=short"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "module"
+markers = [
+    "unit: marks a test as a unit test",
+    "integration: marks tests that call the live Pipefy GraphQL API (PIPEFY_* env)",
+]
+filterwarnings = [
+    # The mcp SDK deprecated the logging capability in its 2026-07-28 revision
+    # (SEP-2577), so every ctx.debug call in the tool modules emits a warning —
+    # roughly a thousand records in a suite run. That buries any genuinely new
+    # warning, and replacing the calls stops the client receiving those lines, which
+    # is a behavior change owed its own review. Remove this line with the ctx.debug
+    # migration.
+    #
+    # Matched on the message, not the bare class, so the SDK's other
+    # MCPDeprecationWarning subjects (sampling, roots) still surface. When the SDK
+    # eventually removes the capability the calls fail outright, so this cannot hide
+    # the removal, only the interim warning.
+    "ignore:The logging capability is deprecated:mcp.shared.exceptions.MCPDeprecationWarning",
+]

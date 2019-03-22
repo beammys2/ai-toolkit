@@ -1,0 +1,10 @@
+{
+  "name": "pipefy",
+  "displayName": "Pipefy",
+  "version": "0.5.2-beta.1",
+  "description": "Pipefy workflow integration for Claude Code.",
+  "author": { "name": "Pipefy", "url": "https://github.com/pipefy" },
+  "homepage": "https://github.com/pipefy/ai-toolkit",
+  "repository": "https://github.com/pipefy/ai-toolkit",
+  "license": "Apache-2.0"
+}

@@ -1,0 +1,1408 @@
+"""Unit tests for PortalService multi-endpoint routing."""
+
+from __future__ import annotations
+
+import importlib
+import json
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from _shared.fixture_ids import (
+    EXAMPLE_NUMERIC_ORG_ID,
+    EXAMPLE_ORG_UUID,
+    EXAMPLE_OTHER_ORG_UUID,
+    EXAMPLE_PIPE_REPO_ID,
+)
+from _shared.mock_clients import mock_executor
+from gql import gql
+from pydantic import ValidationError
+
+from pipefy_sdk.exceptions import PortalPermissionError
+from pipefy_sdk.graphql_executor import PipefyGraphQLError
+from pipefy_sdk.queries.observability_queries import RESOLVE_ORGANIZATION_UUID_QUERY
+from pipefy_sdk.queries.portal_queries import GET_PORTAL_QUERY, LIST_PORTALS_QUERY
+from pipefy_sdk.services.portal_service import PortalService
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_interfaces_query_routes_through_interfaces_client() -> None:
+    """Representative Interfaces call delegates to the Interfaces GraphQL executor."""
+    interfaces = mock_executor({"interfaces": {"edges": []}})
+    service = PortalService(
+        public_executor=mock_executor(),
+        interfaces_executor=interfaces,
+        internal_executor=mock_executor(),
+    )
+
+    query = gql("query { interfaces(orgUuid: $orgUuid) { edges { node { uuid } } } }")
+    variables = {"orgUuid": "org-123"}
+    result = await service.execute_interfaces_query(query, variables)
+
+    interfaces.execute_query.assert_called_once()
+    call_query, call_vars = interfaces.execute_query.call_args[0]
+    assert call_query == query
+    assert call_vars == variables
+    assert result == {"interfaces": {"edges": []}}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sub_portal_element_call_routes_through_internal_api_client() -> None:
+    """Sub-portal wiring mutations delegate to the internal GraphQL executor."""
+    internal = mock_executor({"updateSubPortalElement": {}})
+    service = PortalService(
+        public_executor=mock_executor(),
+        interfaces_executor=mock_executor(),
+        internal_executor=internal,
+    )
+
+    query = gql(
+        "mutation updateSubPortalElement($input: UpdateSubPortalElementInput!) "
+        "{ updateSubPortalElement(input: $input) { success } }"
+    )
+    variables = {
+        "input": {
+            "portalUuid": "portal-uuid",
+            "elementId": 42,
+            "subPortalUuid": "sub-uuid",
+        }
+    }
+    result = await service.execute_internal_api_query(query, variables)
+
+    internal.execute_query.assert_called_once()
+    call_query, call_vars = internal.execute_query.call_args[0]
+    assert call_query == query
+    assert call_vars == variables
+    assert result == {"updateSubPortalElement": {}}
+
+
+def _make_interfaces_service(return_value):
+    public = mock_executor()
+    interfaces = mock_executor(return_value)
+    service = PortalService(
+        public_executor=public,
+        interfaces_executor=interfaces,
+        internal_executor=mock_executor(),
+    )
+    return service, public, interfaces
+
+
+_PORTAL_LIST_GRAPHQL_NODE = {
+    "id": "portal-uuid-1",
+    "name": "Main Portal",
+    "visibility": "internal",
+    "subType": "portal",
+}
+
+_PORTAL_LIST_NODE = {
+    **_PORTAL_LIST_GRAPHQL_NODE,
+    "uuid": "portal-uuid-1",
+}
+
+_PORTAL_DETAIL_GRAPHQL = {
+    "id": "portal-uuid-1",
+    "name": "Main Portal",
+    "visibility": "public",
+    "published": True,
+    "pages": [
+        {
+            "id": "page-1",
+            "title": "Home",
+            "elements": [
+                {
+                    "id": "el-1",
+                    "type": "forms",
+                    "metadata": {"name": "Request form"},
+                }
+            ],
+        }
+    ],
+    "subPortals": [{"id": "sub-1", "name": "Sub Portal 1", "published": False}],
+}
+
+_PORTAL_DETAIL = {
+    **_PORTAL_DETAIL_GRAPHQL,
+    "uuid": "portal-uuid-1",
+    "pages": [
+        {
+            "id": "page-1",
+            "uuid": "page-1",
+            "title": "Home",
+            "elements": [
+                {
+                    "id": "el-1",
+                    "uuid": "el-1",
+                    "type": "forms",
+                    "metadata": {"name": "Request form"},
+                }
+            ],
+        }
+    ],
+    "subPortals": [
+        {"id": "sub-1", "uuid": "sub-1", "name": "Sub Portal 1", "published": False}
+    ],
+}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_returns_portal_nodes() -> None:
+    """list_portals unwraps Relay edges into a flat list of portal dicts."""
+    response = {
+        "interfaces": {
+            "edges": [{"node": _PORTAL_LIST_GRAPHQL_NODE}],
+        }
+    }
+    service, _public, _interfaces_executor = _make_interfaces_service(response)
+
+    result = await service.list_portals(EXAMPLE_ORG_UUID)
+
+    assert result == [_PORTAL_LIST_NODE]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_passes_org_uuid_and_portal_filter() -> None:
+    """list_portals queries interfaces with org_uuid and filterBySubType portal."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"interfaces": {"edges": []}},
+    )
+
+    await service.list_portals(EXAMPLE_OTHER_ORG_UUID)
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    assert query_used is LIST_PORTALS_QUERY
+    assert variables == {
+        "org_uuid": EXAMPLE_OTHER_ORG_UUID,
+        "filterBySubType": "portal",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_passes_search_term_when_provided() -> None:
+    """Optional search_term is forwarded as searchTerm to the GraphQL query."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"interfaces": {"edges": []}},
+    )
+
+    await service.list_portals(EXAMPLE_ORG_UUID, search_term="intake")
+
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    assert query_used is LIST_PORTALS_QUERY
+    assert variables == {
+        "org_uuid": EXAMPLE_ORG_UUID,
+        "filterBySubType": "portal",
+        "searchTerm": "intake",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_empty_returns_empty_list() -> None:
+    """When no portals exist, list_portals returns an empty list."""
+    service, _public, _interfaces_executor = _make_interfaces_service(
+        {"interfaces": {"edges": []}},
+    )
+
+    result = await service.list_portals(EXAMPLE_ORG_UUID)
+
+    assert result == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_uuid_org_identifier_passes_through_unchanged() -> None:
+    """UUID-shaped org identifiers skip resolve and go straight to Interfaces."""
+    service, public_executor, interfaces_executor = _make_interfaces_service(
+        {"interfaces": {"edges": []}},
+    )
+    public_executor.execute_query = AsyncMock()
+
+    await service.list_portals(EXAMPLE_ORG_UUID)
+
+    public_executor.execute_query.assert_not_called()
+    _, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables["org_uuid"] == EXAMPLE_ORG_UUID
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_numeric_org_id_resolves_via_main_graphql_client() -> None:
+    """Numeric org ids resolve on the public GraphQL client before Interfaces list."""
+    service, public_executor, interfaces_executor = _make_interfaces_service(
+        {"interfaces": {"edges": []}},
+    )
+    public_executor.execute_query = AsyncMock(
+        return_value={"organization": {"uuid": EXAMPLE_ORG_UUID}}
+    )
+
+    await service.list_portals(EXAMPLE_NUMERIC_ORG_ID)
+
+    public_executor.execute_query.assert_called_once_with(
+        RESOLVE_ORGANIZATION_UUID_QUERY,
+        {"id": EXAMPLE_NUMERIC_ORG_ID},
+    )
+    _, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables["org_uuid"] == EXAMPLE_ORG_UUID
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_accepts_int_org_id() -> None:
+    """Integer org ids coerce to string before resolve and Interfaces list."""
+    service, public_executor, interfaces_executor = _make_interfaces_service(
+        {"interfaces": {"edges": []}},
+    )
+    public_executor.execute_query = AsyncMock(
+        return_value={"organization": {"uuid": EXAMPLE_ORG_UUID}}
+    )
+
+    await service.list_portals(int(EXAMPLE_NUMERIC_ORG_ID))
+
+    public_executor.execute_query.assert_called_once_with(
+        RESOLVE_ORGANIZATION_UUID_QUERY,
+        {"id": EXAMPLE_NUMERIC_ORG_ID},
+    )
+    _, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables["org_uuid"] == EXAMPLE_ORG_UUID
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_rejects_empty_org_identifier() -> None:
+    """Empty org identifiers raise ValueError before any GraphQL call."""
+    service, _public, _interfaces_executor = _make_interfaces_service(
+        {"interfaces": {"edges": []}},
+    )
+
+    with pytest.raises(ValueError, match="must be non-empty"):
+        await service.list_portals("   ")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_rejects_invalid_org_identifier() -> None:
+    """Non-UUID, non-numeric org identifiers raise ValueError."""
+    service, _public, _interfaces_executor = _make_interfaces_service(
+        {"interfaces": {"edges": []}},
+    )
+
+    with pytest.raises(ValueError, match="must be a UUID or numeric id"):
+        await service.list_portals("not-a-uuid-or-digits")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_portals_org_not_found_on_resolve_raises_value_error() -> None:
+    """When resolve yields no uuid, list_portals raises ValueError."""
+    service, public_executor, _interfaces_executor = _make_interfaces_service(
+        {"interfaces": {"edges": []}},
+    )
+    public_executor.execute_query = AsyncMock(return_value={"organization": None})
+
+    with pytest.raises(ValueError, match="Organization not found"):
+        await service.list_portals(EXAMPLE_NUMERIC_ORG_ID)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_portal_returns_full_portal_shape() -> None:
+    """get_portal returns portal metadata, pages, elements, and sub-portals."""
+    service, _public, _interfaces_executor = _make_interfaces_service(
+        {"portalInterface": _PORTAL_DETAIL_GRAPHQL},
+    )
+
+    result = await service.get_portal("portal-uuid-1")
+
+    assert result == _PORTAL_DETAIL
+    assert result["published"] is True
+    assert len(result["pages"]) == 1
+    assert result["subPortals"][0]["uuid"] == "sub-1"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_portal_not_found_raises_value_error() -> None:
+    """When portalInterface is null, get_portal raises ValueError with the UUID."""
+    service, _public, _interfaces_executor = _make_interfaces_service(
+        {"portalInterface": None},
+    )
+
+    with pytest.raises(ValueError, match="portal-uuid-missing"):
+        await service.get_portal("portal-uuid-missing")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_portal_uses_correct_variables() -> None:
+    """get_portal passes the portal UUID as the uuid GraphQL variable."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"portalInterface": _PORTAL_DETAIL},
+    )
+
+    await service.get_portal("uuid-abc")
+
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    assert query_used is GET_PORTAL_QUERY
+    assert variables == {"uuid": "uuid-abc"}
+
+
+_portal_queries_module = importlib.import_module("pipefy_sdk.queries.portal_queries")
+
+
+def _portal_mutation_constant(name: str):
+    """Return the portal mutation constant when exported; else None (TDD placeholder)."""
+    return getattr(_portal_queries_module, name, None)
+
+
+def _assert_interfaces_mutation_query(query_used: object, constant_name: str) -> None:
+    """Assert Interfaces mutation document matches the expected portal_queries constant."""
+    expected = _portal_mutation_constant(constant_name)
+    if expected is not None:
+        assert query_used is expected
+    else:
+        operation_snippets = {
+            "FIND_OR_CREATE_PORTAL_MUTATION": "findOrCreateInterfaceByTemplate",
+            "UPDATE_INTERFACE_MUTATION": "updateInterface",
+            "DELETE_INTERFACE_MUTATION": "deleteInterface",
+            "CREATE_PAGE_MUTATION": "createPage",
+            "UPDATE_PAGE_MUTATION": "updatePage",
+            "DELETE_PAGE_MUTATION": "deletePage",
+            "SORT_PAGES_MUTATION": "sortPages",
+            "UPDATE_PAGE_LAYOUT_MUTATION": "updatePageLayout",
+            "CREATE_ELEMENT_MUTATION": "createElement",
+            "UPDATE_ELEMENT_MUTATION": "updateElement",
+            "DELETE_ELEMENT_MUTATION": "deleteElement",
+            "DUPLICATE_ELEMENT_MUTATION": "duplicateElement",
+            "CREATE_SUB_PORTAL_MUTATION": "createSubPortal",
+        }
+        assert operation_snippets[constant_name] in str(query_used)
+
+
+try:
+    _portal_internal_queries_module = importlib.import_module(
+        "pipefy_sdk.queries.portal_internal_queries"
+    )
+except ModuleNotFoundError:
+    _portal_internal_queries_module = None
+
+
+def _portal_internal_mutation_constant(name: str):
+    """Return the Internal API mutation constant when exported; else None (TDD)."""
+    if _portal_internal_queries_module is None:
+        return None
+    return getattr(_portal_internal_queries_module, name, None)
+
+
+def _assert_internal_mutation_query(query_used: object, constant_name: str) -> None:
+    """Assert Internal API mutation document matches the expected constant."""
+    expected = _portal_internal_mutation_constant(constant_name)
+    if expected is not None:
+        assert query_used is expected
+    else:
+        operation_snippets = {
+            "UPDATE_SUB_PORTAL_ELEMENT_MUTATION": "updateSubPortalElement",
+            "DELETE_SUB_PORTAL_ELEMENT_MUTATION": "deleteSubPortalElement",
+            "DELETE_SUB_PORTAL_INTERFACE_MUTATION": "deleteSubPortalInterface",
+        }
+        assert operation_snippets[constant_name] in str(query_used)
+
+
+def _make_portal_service_with_clients(
+    *,
+    interfaces_return: dict | None = None,
+    internal_return: dict | None = None,
+) -> tuple[PortalService, MagicMock, MagicMock]:
+    """PortalService with mocked Interfaces and Internal API clients."""
+    interfaces = mock_executor(interfaces_return)
+    internal = mock_executor(internal_return)
+    service = PortalService(
+        public_executor=mock_executor(),
+        interfaces_executor=interfaces,
+        internal_executor=internal,
+    )
+    return service, interfaces, internal
+
+
+_CREATE_PORTAL_GRAPHQL_INTERFACE = {
+    "id": "portal-created-uuid",
+    "name": "Org Portal",
+    "visibility": "internal",
+    "subType": "portal",
+}
+
+_CREATE_PORTAL_RESPONSE = {
+    "findOrCreateInterfaceByTemplate": {
+        "interface": _CREATE_PORTAL_GRAPHQL_INTERFACE,
+    }
+}
+
+_PERMISSION_DENIED_ERROR = PipefyGraphQLError(
+    [
+        {
+            "message": "Permission Denied",
+            "extensions": {"code": "PERMISSION_DENIED"},
+        }
+    ],
+)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_resolves_numeric_org_and_calls_find_or_create_template() -> (
+    None
+):
+    """create_portal resolves numeric org id then findOrCreateInterfaceByTemplate."""
+    service, public_executor, interfaces_executor = _make_interfaces_service(
+        _CREATE_PORTAL_RESPONSE,
+    )
+    public_executor.execute_query = AsyncMock(
+        return_value={"organization": {"uuid": EXAMPLE_ORG_UUID}}
+    )
+
+    result = await service.create_portal(EXAMPLE_NUMERIC_ORG_ID)
+
+    public_executor.execute_query.assert_called_once_with(
+        RESOLVE_ORGANIZATION_UUID_QUERY,
+        {"id": EXAMPLE_NUMERIC_ORG_ID},
+    )
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "FIND_OR_CREATE_PORTAL_MUTATION")
+    assert variables == {"input": {"orgUuid": EXAMPLE_ORG_UUID, "subType": "portal"}}
+    assert result["uuid"] == "portal-created-uuid"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_uuid_org_skips_resolve() -> None:
+    """UUID-shaped org identifiers skip resolve before findOrCreate mutation."""
+    service, public_executor, interfaces_executor = _make_interfaces_service(
+        _CREATE_PORTAL_RESPONSE,
+    )
+    public_executor.execute_query = AsyncMock()
+
+    await service.create_portal(EXAMPLE_ORG_UUID)
+
+    public_executor.execute_query.assert_not_called()
+    _, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables == {"input": {"orgUuid": EXAMPLE_ORG_UUID, "subType": "portal"}}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_idempotent_returns_same_interface_uuid() -> None:
+    """Second create_portal call returns the same interface uuid (idempotent)."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_PORTAL_RESPONSE,
+    )
+
+    first = await service.create_portal(EXAMPLE_ORG_UUID)
+    second = await service.create_portal(EXAMPLE_ORG_UUID)
+
+    assert first["uuid"] == second["uuid"] == "portal-created-uuid"
+    assert interfaces_executor.execute_query.call_count == 2
+    for call in interfaces_executor.execute_query.call_args_list:
+        _, variables = call[0]
+        assert variables == {
+            "input": {"orgUuid": EXAMPLE_ORG_UUID, "subType": "portal"}
+        }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_portal_passes_only_set_fields_under_input() -> None:
+    """update_portal sends snake_case interface_uuid and only provided fields."""
+    update_response = {
+        "updateInterface": {
+            "interface": {**_CREATE_PORTAL_GRAPHQL_INTERFACE, "name": "Renamed"},
+        }
+    }
+    service, _public, interfaces_executor = _make_interfaces_service(update_response)
+
+    await service.update_portal("portal-created-uuid", name="Renamed")
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "UPDATE_INTERFACE_MUTATION")
+    assert variables == {
+        "input": {"interface_uuid": "portal-created-uuid", "name": "Renamed"}
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_portal_omits_unset_optional_fields() -> None:
+    """Unset optional fields are not included in updateInterface input."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {
+            "updateInterface": {
+                "interface": {
+                    **_CREATE_PORTAL_GRAPHQL_INTERFACE,
+                    "visibility": "public",
+                }
+            }
+        },
+    )
+
+    await service.update_portal(
+        "portal-created-uuid",
+        visibility="public",
+    )
+
+    _, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables == {
+        "input": {
+            "interface_uuid": "portal-created-uuid",
+            "visibility": "public",
+        }
+    }
+    assert "name" not in variables["input"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_portal_rejects_invalid_visibility_before_graphql() -> None:
+    """Invalid visibility values raise ValidationError before any GraphQL call."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"updateInterface": {"interface": _CREATE_PORTAL_GRAPHQL_INTERFACE}},
+    )
+
+    with pytest.raises(ValidationError):
+        await service.update_portal(
+            "portal-created-uuid",
+            visibility="public_visibility",
+        )
+
+    interfaces_executor.execute_query.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_portal_serializes_all_fields_with_camel_case_aliases() -> None:
+    """update_portal sends displayPipefyHeader and omits unset fields."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {
+            "updateInterface": {
+                "interface": {
+                    **_CREATE_PORTAL_GRAPHQL_INTERFACE,
+                    "name": "Full Update",
+                    "visibility": "public",
+                }
+            }
+        },
+    )
+
+    await service.update_portal(
+        "portal-created-uuid",
+        name="Full Update",
+        visibility="public",
+        color="#aabbcc",
+        icon="layout",
+        display_pipefy_header=True,
+    )
+
+    _, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables == {
+        "input": {
+            "interface_uuid": "portal-created-uuid",
+            "name": "Full Update",
+            "visibility": "public",
+            "color": "#aabbcc",
+            "icon": "layout",
+            "displayPipefyHeader": True,
+        }
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_delete_portal_calls_delete_interface_with_interface_uuid() -> None:
+    """delete_portal uses deleteInterface with snake_case input.interface_uuid."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"deleteInterface": {"success": True}},
+    )
+
+    result = await service.delete_portal("portal-to-delete")
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "DELETE_INTERFACE_MUTATION")
+    assert variables == {"input": {"interface_uuid": "portal-to-delete"}}
+    assert result == {"deleteInterface": {"success": True}}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_permission_denied_surfaces_actionable_message() -> None:
+    """PERMISSION_DENIED from Interfaces maps to portal permission guidance."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_PORTAL_RESPONSE,
+    )
+    interfaces_executor.execute_query = AsyncMock(side_effect=_PERMISSION_DENIED_ERROR)
+
+    with pytest.raises(PortalPermissionError, match=r"(create_portal|manage_portals)"):
+        await service.create_portal(EXAMPLE_ORG_UUID)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_portal_permission_denied_surfaces_actionable_message() -> None:
+    """PERMISSION_DENIED on update maps to portal permission guidance."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"updateInterface": {"interface": _CREATE_PORTAL_GRAPHQL_INTERFACE}},
+    )
+    interfaces_executor.execute_query = AsyncMock(side_effect=_PERMISSION_DENIED_ERROR)
+
+    with pytest.raises(PortalPermissionError, match=r"(create_portal|manage_portals)"):
+        await service.update_portal("portal-created-uuid", name="Renamed")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_delete_portal_permission_denied_surfaces_actionable_message() -> None:
+    """PERMISSION_DENIED on delete maps to portal permission guidance."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"deleteInterface": {"success": True}},
+    )
+    interfaces_executor.execute_query = AsyncMock(side_effect=_PERMISSION_DENIED_ERROR)
+
+    with pytest.raises(PortalPermissionError, match=r"(create_portal|manage_portals)"):
+        await service.delete_portal("portal-to-delete")
+
+
+_INTERFACE_UUID = "portal-uuid-1"
+_PAGE_ID = "page-uuid-1"
+_PAGE_ID_2 = "page-uuid-2"
+_PAGE_TITLE = "Portal Home"
+
+_CREATE_PAGE_GRAPHQL = {
+    "id": _PAGE_ID,
+    "title": _PAGE_TITLE,
+    "elements": [{"id": "el-1", "type": "text"}],
+}
+
+_CREATE_PAGE_RESPONSE = {
+    "createPage": {"page": _CREATE_PAGE_GRAPHQL},
+}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_page_calls_create_page_with_interface_uuid_and_title() -> (
+    None
+):
+    """create_portal_page uses createPage with interface_uuid and title."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_PAGE_RESPONSE,
+    )
+
+    result = await service.create_portal_page(_INTERFACE_UUID, _PAGE_TITLE)
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "CREATE_PAGE_MUTATION")
+    assert variables == {
+        "input": {"interface_uuid": _INTERFACE_UUID, "title": _PAGE_TITLE}
+    }
+    assert result["uuid"] == _PAGE_ID
+    assert result["title"] == _PAGE_TITLE
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_page_forwards_optional_fields() -> None:
+    """Optional createPage fields are included when provided."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_PAGE_RESPONSE,
+    )
+
+    await service.create_portal_page(
+        _INTERFACE_UUID,
+        _PAGE_TITLE,
+        description="Landing copy",
+        index=1,
+    )
+
+    _, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables == {
+        "input": {
+            "interface_uuid": _INTERFACE_UUID,
+            "title": _PAGE_TITLE,
+            "description": "Landing copy",
+            "index": 1,
+        }
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_portal_page_calls_update_page_with_required_ids() -> None:
+    """update_portal_page uses updatePage with interface_uuid and page_id."""
+    update_response = {
+        "updatePage": {
+            "page": {**_CREATE_PAGE_GRAPHQL, "title": "Renamed Page"},
+        }
+    }
+    service, _public, interfaces_executor = _make_interfaces_service(update_response)
+
+    result = await service.update_portal_page(
+        _INTERFACE_UUID,
+        _PAGE_ID,
+        title="Renamed Page",
+    )
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "UPDATE_PAGE_MUTATION")
+    assert variables == {
+        "input": {
+            "interface_uuid": _INTERFACE_UUID,
+            "page_id": _PAGE_ID,
+            "title": "Renamed Page",
+        }
+    }
+    assert result["title"] == "Renamed Page"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_portal_page_omits_unset_optional_fields() -> None:
+    """Unset optional updatePage fields are not sent to GraphQL."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"updatePage": {"page": _CREATE_PAGE_GRAPHQL}},
+    )
+
+    await service.update_portal_page(
+        _INTERFACE_UUID,
+        _PAGE_ID,
+        description="Only description changed",
+    )
+
+    _, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables == {
+        "input": {
+            "interface_uuid": _INTERFACE_UUID,
+            "page_id": _PAGE_ID,
+            "description": "Only description changed",
+        }
+    }
+    assert "title" not in variables["input"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_delete_portal_page_calls_delete_page_with_interface_and_page_ids() -> (
+    None
+):
+    """delete_portal_page uses deletePage with interface_uuid and page_id."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"deletePage": {"success": True}},
+    )
+
+    result = await service.delete_portal_page(_INTERFACE_UUID, _PAGE_ID)
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "DELETE_PAGE_MUTATION")
+    assert variables == {
+        "input": {"interface_uuid": _INTERFACE_UUID, "page_id": _PAGE_ID}
+    }
+    assert result == {"deletePage": {"success": True}}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sort_portal_pages_calls_sort_pages_with_page_ids_list() -> None:
+    """sort_portal_pages uses sortPages with interface_uuid and page_ids."""
+    page_ids = [_PAGE_ID_2, _PAGE_ID]
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"sortPages": {"success": True}},
+    )
+
+    result = await service.sort_portal_pages(_INTERFACE_UUID, page_ids)
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "SORT_PAGES_MUTATION")
+    assert variables == {
+        "input": {"interface_uuid": _INTERFACE_UUID, "page_ids": page_ids}
+    }
+    assert result == {"sortPages": {"success": True}}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_portal_page_layout_does_not_send_interface_uuid() -> None:
+    """update_portal_page_layout uses updatePageLayout with page_id and layout only."""
+    layout = {"rows": [{"columns": [{"width": 12}]}]}
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"updatePageLayout": {"success": True}},
+    )
+
+    result = await service.update_portal_page_layout(_PAGE_ID, layout)
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "UPDATE_PAGE_LAYOUT_MUTATION")
+    assert variables == {
+        "input": {
+            "page_id": _PAGE_ID,
+            "layout": json.dumps(layout, separators=(",", ":"), ensure_ascii=False),
+        }
+    }
+    assert "interface_uuid" not in variables["input"]
+    assert result == {"updatePageLayout": {"success": True}}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_page_permission_denied_surfaces_actionable_message() -> (
+    None
+):
+    """PERMISSION_DENIED on createPage maps to portal permission guidance."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_PAGE_RESPONSE,
+    )
+    interfaces_executor.execute_query = AsyncMock(side_effect=_PERMISSION_DENIED_ERROR)
+
+    with pytest.raises(PortalPermissionError, match=r"(create_portal|manage_portals)"):
+        await service.create_portal_page(_INTERFACE_UUID, _PAGE_TITLE)
+
+
+_ELEMENT_ID = "el-uuid-1"
+_FORMS_METADATA = {"name": "Request form"}
+_FORMS_DATA_SOURCES = [{"repoId": EXAMPLE_PIPE_REPO_ID}]
+
+_CREATE_ELEMENT_GRAPHQL = {
+    "id": _ELEMENT_ID,
+    "type": "forms",
+    "metadata": _FORMS_METADATA,
+}
+
+_CREATE_ELEMENT_RESPONSE = {
+    "createElement": {"element": _CREATE_ELEMENT_GRAPHQL},
+}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_element_calls_create_element_with_validated_input() -> (
+    None
+):
+    """create_portal_element validates via CreatePortalElementInput then createElement."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_ELEMENT_RESPONSE,
+    )
+
+    await service.create_portal_element(
+        _PAGE_ID,
+        type="forms",
+        metadata=_FORMS_METADATA,
+        data_sources=_FORMS_DATA_SOURCES,
+    )
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "CREATE_ELEMENT_MUTATION")
+    assert variables == {
+        "input": {
+            "page_id": _PAGE_ID,
+            "type": "forms",
+            "metadata": json.dumps(
+                _FORMS_METADATA, separators=(",", ":"), ensure_ascii=False
+            ),
+            "data_sources": [{"repoId": EXAMPLE_PIPE_REPO_ID, "fieldKeys": []}],
+        }
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_element_always_sends_empty_data_sources_for_link() -> None:
+    """Link creates must send data_sources: [] so Pipefy does not receive null."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_ELEMENT_RESPONSE,
+    )
+    link_metadata = {"linkName": "Test", "linkUrl": "https://example.com"}
+
+    await service.create_portal_element(_PAGE_ID, type="link", metadata=link_metadata)
+
+    _query_used, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables["input"]["data_sources"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_element_logs_warning_for_unrecognized_data_source_keys(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Invalid data_sources entries are skipped with a warning (e.g. LLM-guessed pipe_id)."""
+    caplog.set_level(logging.WARNING, logger="pipefy_sdk.services.portal_service")
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_ELEMENT_RESPONSE,
+    )
+
+    await service.create_portal_element(
+        _PAGE_ID,
+        type="forms",
+        metadata=_FORMS_METADATA,
+        data_sources=[{"pipe_id": "123"}],
+    )
+
+    assert any("Skipping portal data_sources" in r.message for r in caplog.records)
+    _query_used, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables["input"]["data_sources"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_element_reads_only_declared_repo_id_key(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only the declared ``repoId`` key is honored; ``repo_uuid``/``repoUuid`` are skipped."""
+    caplog.set_level(logging.WARNING, logger="pipefy_sdk.services.portal_service")
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_ELEMENT_RESPONSE,
+    )
+
+    await service.create_portal_element(
+        _PAGE_ID,
+        type="forms",
+        metadata=_FORMS_METADATA,
+        data_sources=[{"repo_uuid": "p-1"}, {"repoUuid": "p-2"}],
+    )
+
+    assert any("Skipping portal data_sources" in r.message for r in caplog.records)
+    _query_used, variables = interfaces_executor.execute_query.call_args[0]
+    assert variables["input"]["data_sources"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_element_graphql_error_is_not_portal_permission_error() -> (
+    None
+):
+    """Non-permission Interfaces failures must not be wrapped as PortalPermissionError."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_ELEMENT_RESPONSE,
+    )
+    interfaces_executor.execute_query = AsyncMock(
+        side_effect=PipefyGraphQLError(
+            [{"message": "Variable $input was provided invalid value"}],
+        )
+    )
+
+    with pytest.raises(PipefyGraphQLError):
+        await service.create_portal_element(
+            _PAGE_ID,
+            type="link",
+            metadata={"linkName": "Test", "linkUrl": "https://example.com"},
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_portal_permission_mapping_only_inspects_the_first_error() -> None:
+    """A PERMISSION_DENIED that is not the first error re-raises PipefyGraphQLError.
+
+    Permission mapping delegates to ``classify_exception``, which classifies the
+    first error only. Portal responses carry a single error in practice, so this
+    narrowing (versus scanning every error) is not observable there. Pinning it
+    keeps a future contributor from reading the first-error behavior as a bug.
+    """
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_ELEMENT_RESPONSE,
+    )
+    interfaces_executor.execute_query = AsyncMock(
+        side_effect=PipefyGraphQLError(
+            [
+                {"message": "Bad input", "extensions": {"code": "BAD_REQUEST"}},
+                {"message": "Denied", "extensions": {"code": "PERMISSION_DENIED"}},
+            ],
+        )
+    )
+
+    with pytest.raises(PipefyGraphQLError):
+        await service.create_portal_element(
+            _PAGE_ID,
+            type="link",
+            metadata={"linkName": "Test", "linkUrl": "https://example.com"},
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["FORBIDDEN", "UNAUTHORIZED"])
+async def test_portal_permission_mapping_covers_permission_code_synonyms(
+    code: str,
+) -> None:
+    """FORBIDDEN and UNAUTHORIZED also map to ``PortalPermissionError``.
+
+    The shared ``classify_exception`` groups these with PERMISSION_DENIED, so
+    delegating to it widened portal mapping beyond the one literal code the old
+    hand-rolled scan matched. Portal returns PERMISSION_DENIED today; pinning the
+    synonyms records that the widening is intended, not accidental.
+    """
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_ELEMENT_RESPONSE,
+    )
+    interfaces_executor.execute_query = AsyncMock(
+        side_effect=PipefyGraphQLError(
+            [{"message": "Denied", "extensions": {"code": code}}],
+        )
+    )
+
+    with pytest.raises(PortalPermissionError, match=r"(create_portal|manage_portals)"):
+        await service.create_portal_element(
+            _PAGE_ID,
+            type="link",
+            metadata={"linkName": "Test", "linkUrl": "https://example.com"},
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_portal_element_rejects_invalid_metadata_before_graphql() -> None:
+    """CreatePortalElementInput validation must run before execute_query."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        _CREATE_ELEMENT_RESPONSE,
+    )
+
+    with pytest.raises(ValidationError, match="name"):
+        await service.create_portal_element(
+            _PAGE_ID,
+            type="forms",
+            metadata={},
+        )
+
+    interfaces_executor.execute_query.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_portal_element_calls_update_element_with_full_metadata() -> None:
+    """update_portal_element sends element_id, page_id, and full metadata replace."""
+    link_metadata = {
+        "linkUrl": "https://example.com/pipefy",
+        "linkName": "Open",
+    }
+    update_response = {"updateElement": {"success": True}}
+    service, _public, interfaces_executor = _make_interfaces_service(update_response)
+
+    result = await service.update_portal_element(
+        _ELEMENT_ID,
+        _PAGE_ID,
+        type="link",
+        metadata=link_metadata,
+    )
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "UPDATE_ELEMENT_MUTATION")
+    assert variables == {
+        "input": {
+            "element_id": _ELEMENT_ID,
+            "page_id": _PAGE_ID,
+            "metadata": json.dumps(
+                link_metadata, separators=(",", ":"), ensure_ascii=False
+            ),
+            "data_sources": [],
+        }
+    }
+    assert result["metadata"]["linkUrl"] == "https://example.com/pipefy"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_delete_portal_element_calls_delete_element_with_ids() -> None:
+    """delete_portal_element uses deleteElement with element_id and page_id."""
+    service, _public, interfaces_executor = _make_interfaces_service(
+        {"deleteElement": {"success": True}},
+    )
+
+    result = await service.delete_portal_element(_ELEMENT_ID, _PAGE_ID)
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "DELETE_ELEMENT_MUTATION")
+    assert variables == {
+        "input": {"element_id": _ELEMENT_ID, "page_id": _PAGE_ID},
+    }
+    assert result == {"deleteElement": {"success": True}}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_duplicate_portal_element_sends_camel_case_duplicate_input() -> None:
+    """duplicateElement input uses elementUuid, interfaceUuid, pageUuid (camelCase)."""
+    dup_response = {
+        "duplicateElement": {
+            "element": {"id": "el-copy", "type": "text", "metadata": {}},
+        }
+    }
+    service, _public, interfaces_executor = _make_interfaces_service(dup_response)
+
+    result = await service.duplicate_portal_element(
+        element_id=_ELEMENT_ID,
+        portal_uuid=_INTERFACE_UUID,
+        page_id=_PAGE_ID,
+    )
+
+    interfaces_executor.execute_query.assert_called_once()
+    query_used, variables = interfaces_executor.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "DUPLICATE_ELEMENT_MUTATION")
+    assert variables == {
+        "input": {
+            "elementUuid": _ELEMENT_ID,
+            "interfaceUuid": _INTERFACE_UUID,
+            "pageUuid": _PAGE_ID,
+        }
+    }
+    assert result["uuid"] == "el-copy"
+
+
+_MAIN_PORTAL_UUID = "portal-main-uuid"
+_SUB_PORTAL_UUID = "sub-portal-uuid"
+_FORMS_ELEMENT_ID = "forms-element-uuid"
+_SUB_PORTAL_NAME = "Intake sub-portal"
+
+_CREATE_SUB_PORTAL_GRAPHQL = {
+    "id": _SUB_PORTAL_UUID,
+    "name": _SUB_PORTAL_NAME,
+}
+
+_CREATE_SUB_PORTAL_RESPONSE = {
+    "createSubPortal": {"subPortal": _CREATE_SUB_PORTAL_GRAPHQL},
+}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_sub_portal_calls_create_sub_portal_on_interfaces() -> None:
+    """create_sub_portal uses Interfaces createSubPortal with mainPortalUuid."""
+    service, interfaces_client, internal_client = _make_portal_service_with_clients(
+        interfaces_return=_CREATE_SUB_PORTAL_RESPONSE,
+    )
+
+    result = await service.create_sub_portal(_MAIN_PORTAL_UUID, name=_SUB_PORTAL_NAME)
+
+    interfaces_client.execute_query.assert_called_once()
+    internal_client.execute_query.assert_not_called()
+    query_used, variables = interfaces_client.execute_query.call_args[0]
+    _assert_interfaces_mutation_query(query_used, "CREATE_SUB_PORTAL_MUTATION")
+    assert variables == {
+        "input": {
+            "mainPortalUuid": _MAIN_PORTAL_UUID,
+            "name": _SUB_PORTAL_NAME,
+        }
+    }
+    assert result["uuid"] == _SUB_PORTAL_UUID
+    assert result["name"] == _SUB_PORTAL_NAME
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_sub_portal_omits_name_when_not_provided() -> None:
+    """Optional name is omitted from createSubPortal input when None."""
+    service, interfaces_client, _internal_client = _make_portal_service_with_clients(
+        interfaces_return=_CREATE_SUB_PORTAL_RESPONSE,
+    )
+
+    await service.create_sub_portal(_MAIN_PORTAL_UUID)
+
+    _, variables = interfaces_client.execute_query.call_args[0]
+    assert variables == {"input": {"mainPortalUuid": _MAIN_PORTAL_UUID}}
+    assert "name" not in variables["input"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_sub_portal_element_routes_through_internal_api() -> None:
+    """update_sub_portal_element uses Internal API updateSubPortalElement."""
+    internal_response = {"updateSubPortalElement": {"success": True}}
+    service, interfaces_client, internal_client = _make_portal_service_with_clients(
+        internal_return=internal_response,
+    )
+
+    result = await service.update_sub_portal_element(
+        _MAIN_PORTAL_UUID,
+        _FORMS_ELEMENT_ID,
+        _SUB_PORTAL_UUID,
+    )
+
+    interfaces_client.execute_query.assert_not_called()
+    internal_client.execute_query.assert_called_once()
+    query_used, variables = internal_client.execute_query.call_args[0]
+    _assert_internal_mutation_query(query_used, "UPDATE_SUB_PORTAL_ELEMENT_MUTATION")
+    assert variables == {
+        "input": {
+            "portalUuid": _MAIN_PORTAL_UUID,
+            "elementId": _FORMS_ELEMENT_ID,
+            "subPortalUuid": _SUB_PORTAL_UUID,
+        }
+    }
+    assert result == internal_response
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_publish_sub_portal_delegates_to_update_sub_portal_element() -> None:
+    """publish_sub_portal wires subPortalUuid via updateSubPortalElement (not createElement)."""
+    internal_response = {"updateSubPortalElement": {"success": True}}
+    service, interfaces_client, internal_client = _make_portal_service_with_clients(
+        internal_return=internal_response,
+    )
+
+    result = await service.publish_sub_portal(
+        _MAIN_PORTAL_UUID,
+        _FORMS_ELEMENT_ID,
+        _SUB_PORTAL_UUID,
+    )
+
+    interfaces_client.execute_query.assert_not_called()
+    internal_client.execute_query.assert_called_once()
+    _, variables = internal_client.execute_query.call_args[0]
+    assert variables["input"]["subPortalUuid"] == _SUB_PORTAL_UUID
+    assert result == internal_response
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_unpublish_sub_portal_sends_null_sub_portal_uuid() -> None:
+    """unpublish_sub_portal clears subPortalUuid (null); 6.7 integration confirms detach."""
+    service, interfaces_client, internal_client = _make_portal_service_with_clients(
+        internal_return={"updateSubPortalElement": {"success": True}},
+    )
+
+    await service.unpublish_sub_portal(_MAIN_PORTAL_UUID, _FORMS_ELEMENT_ID)
+
+    interfaces_client.execute_query.assert_not_called()
+    internal_client.execute_query.assert_called_once()
+    _, variables = internal_client.execute_query.call_args[0]
+    assert variables == {
+        "input": {
+            "portalUuid": _MAIN_PORTAL_UUID,
+            "elementId": _FORMS_ELEMENT_ID,
+            "subPortalUuid": None,
+        }
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_delete_sub_portal_element_routes_through_internal_api() -> None:
+    """delete_sub_portal_element uses Internal API deleteSubPortalElement."""
+    internal_response = {"deleteSubPortalElement": {"success": True}}
+    service, interfaces_client, internal_client = _make_portal_service_with_clients(
+        internal_return=internal_response,
+    )
+
+    result = await service.delete_sub_portal_element(
+        _MAIN_PORTAL_UUID,
+        _FORMS_ELEMENT_ID,
+    )
+
+    interfaces_client.execute_query.assert_not_called()
+    internal_client.execute_query.assert_called_once()
+    query_used, variables = internal_client.execute_query.call_args[0]
+    _assert_internal_mutation_query(query_used, "DELETE_SUB_PORTAL_ELEMENT_MUTATION")
+    assert variables == {
+        "input": {
+            "portalUuid": _MAIN_PORTAL_UUID,
+            "elementId": _FORMS_ELEMENT_ID,
+        }
+    }
+    assert result == internal_response
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_delete_sub_portal_calls_delete_sub_portal_interface() -> None:
+    """delete_sub_portal removes the sub-portal entity via deleteSubPortalInterface."""
+    internal_response = {"deleteSubPortalInterface": {"success": True}}
+    service, interfaces_client, internal_client = _make_portal_service_with_clients(
+        internal_return=internal_response,
+    )
+
+    result = await service.delete_sub_portal(_SUB_PORTAL_UUID)
+
+    interfaces_client.execute_query.assert_not_called()
+    internal_client.execute_query.assert_called_once()
+    query_used, variables = internal_client.execute_query.call_args[0]
+    _assert_internal_mutation_query(query_used, "DELETE_SUB_PORTAL_INTERFACE_MUTATION")
+    assert variables == {"input": {"uuid": _SUB_PORTAL_UUID}}
+    assert result == internal_response
+
+
+_INTERNAL_API_PERMISSION_DENIED_ERROR = PipefyGraphQLError(
+    [
+        {
+            "message": "User does not have permission to manage portals",
+            "extensions": {
+                "code": "PERMISSION_DENIED",
+                "correlation_id": "abc-123",
+            },
+        }
+    ],
+)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "call_args"),
+    [
+        (
+            "update_sub_portal_element",
+            (_MAIN_PORTAL_UUID, _FORMS_ELEMENT_ID, _SUB_PORTAL_UUID),
+        ),
+        (
+            "publish_sub_portal",
+            (_MAIN_PORTAL_UUID, _FORMS_ELEMENT_ID, _SUB_PORTAL_UUID),
+        ),
+        (
+            "unpublish_sub_portal",
+            (_MAIN_PORTAL_UUID, _FORMS_ELEMENT_ID),
+        ),
+        (
+            "delete_sub_portal_element",
+            (_MAIN_PORTAL_UUID, _FORMS_ELEMENT_ID),
+        ),
+        ("delete_sub_portal", (_SUB_PORTAL_UUID,)),
+    ],
+)
+async def test_sub_portal_internal_api_permission_denied_surfaces_actionable_message(
+    method_name: str,
+    call_args: tuple[str, ...],
+) -> None:
+    """PERMISSION_DENIED from the Internal API maps to portal permission guidance."""
+    service, _interfaces_client, internal_client = _make_portal_service_with_clients()
+    internal_client.execute_query = AsyncMock(
+        side_effect=_INTERNAL_API_PERMISSION_DENIED_ERROR
+    )
+
+    with pytest.raises(PortalPermissionError, match=r"(create_portal|manage_portals)"):
+        await getattr(service, method_name)(*call_args)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sub_portal_internal_api_non_permission_error_propagates() -> None:
+    """Non-permission Internal API errors must not become PortalPermissionError."""
+    service, _interfaces_client, internal_client = _make_portal_service_with_clients()
+    bad_request = PipefyGraphQLError(
+        [{"message": "Bad request", "extensions": {"code": "BAD_REQUEST"}}]
+    )
+    internal_client.execute_query = AsyncMock(side_effect=bad_request)
+
+    with pytest.raises(PipefyGraphQLError, match="Bad request"):
+        await service.update_sub_portal_element(
+            _MAIN_PORTAL_UUID,
+            _FORMS_ELEMENT_ID,
+            _SUB_PORTAL_UUID,
+        )

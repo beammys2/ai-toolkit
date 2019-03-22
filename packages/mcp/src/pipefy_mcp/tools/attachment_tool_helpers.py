@@ -1,0 +1,155 @@
+"""Payload builders and error strings for attachment upload MCP tools."""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pipefy_sdk import PresignedUploadTarget
+from pydantic import ValidationError
+
+from pipefy_mcp.core.tool_error_envelope import tool_error
+from pipefy_mcp.tools.graphql_error_helpers import extract_error_strings
+
+UploadFlowStep = Literal[
+    "validation",
+    "file_read",
+    "download",
+    "presigned_url",
+    "s3_upload",
+    "field_update",
+]
+
+
+def build_upload_success_payload(
+    *,
+    download_url: str | None,
+    file_name: str,
+    content_type: str,
+    file_size: int,
+    field_id: str,
+    card_id: str | int | None = None,
+    table_record_id: str | None = None,
+) -> dict[str, Any]:
+    """Structured success payload for a completed upload.
+
+    Args:
+        download_url: Permanent/signed download URL from Pipefy (may be None if API omits it).
+        file_name: File name used for the upload.
+        content_type: MIME type sent to storage.
+        file_size: Uploaded size in bytes.
+        field_id: Updated attachment field id.
+        card_id: Target card id (card uploads).
+        table_record_id: Target table record id (table uploads).
+    """
+    payload: dict[str, Any] = {
+        "success": True,
+        "download_url": download_url,
+        "file_name": file_name,
+        "content_type": content_type,
+        "file_size": file_size,
+        "field_id": field_id,
+    }
+    if card_id is not None:
+        payload["card_id"] = card_id
+    if table_record_id is not None:
+        payload["table_record_id"] = table_record_id
+    return payload
+
+
+def build_presigned_success_payload(target: PresignedUploadTarget) -> dict[str, Any]:
+    """Structured success payload for a minted presigned upload target.
+
+    Carries the S3 PUT ``upload_url`` the caller uploads to and the
+    ``storage_path`` (object key) to store on the field afterward — never the
+    url. ``expires_in_seconds`` may be None if the url declares no expiry.
+    """
+    return {
+        "success": True,
+        "upload_url": target["upload_url"],
+        "storage_path": target["storage_path"],
+        "expires_in_seconds": target["expires_in_seconds"],
+    }
+
+
+def build_upload_error_payload(
+    *,
+    message: str,
+    step: UploadFlowStep,
+) -> dict[str, Any]:
+    """Structured failure payload for the upload flow.
+
+    Args:
+        message: Actionable reason for the caller.
+        step: Failed stage (``validation``, ``file_read``, ``download``, ``presigned_url``, ``s3_upload``, ``field_update``).
+    """
+    out: dict[str, Any] = tool_error(message)
+    out["step"] = step
+    return out
+
+
+def format_s3_upload_failure(upload_result: dict[str, Any]) -> str:
+    """Build an agent-facing message from the S3 PUT outcome carried on an
+    :class:`AttachmentUploadError` for ``step="s3_upload"``.
+
+    Args:
+        upload_result: Dict containing at least ``status_code``; may include ``body_snippet``.
+    """
+    code = upload_result.get("status_code")
+    snippet = upload_result.get("body_snippet")
+    base = f"S3 upload failed with HTTP status {code}."
+    if isinstance(snippet, str) and snippet.strip():
+        body = snippet.strip()[:300]
+        hint = ""
+        if "ExpiredToken" in snippet or "request has expired" in snippet.lower():
+            hint = (
+                " The presigned URL may have expired; call the upload tool again "
+                "to obtain a fresh URL."
+            )
+        elif "SignatureDoesNotMatch" in snippet:
+            hint = (
+                " The request body or headers may not match what was signed "
+                "(check content length and Content-Type)."
+            )
+        if hint:
+            return f"{base} Response snippet: {body}.{hint}"
+        return f"{base} Response snippet: {body}"
+    return f"{base} Check content type, size, and presigned URL validity."
+
+
+def map_upload_error_to_message(exc: BaseException) -> str:
+    """Map a validation or transport/GraphQL exception to a short, actionable message.
+
+    File-read errors are short-circuited by
+    :func:`_upload_error_envelope` in :mod:`pipefy_mcp.tools.attachment_tools`
+    (the originating :class:`pipefy_infra.filesystem.LocalFileError` carries
+    user-facing text directly), so they do not flow through this mapper.
+
+    Args:
+        exc: Failure from input validation, transport, or GraphQL.
+    """
+    if isinstance(exc, ValidationError):
+        parts: list[str] = []
+        for err in exc.errors():
+            loc = ".".join(str(x) for x in err.get("loc", ()))
+            msg = err.get("msg", "invalid")
+            if loc:
+                parts.append(f"{loc}: {msg}")
+            else:
+                parts.append(str(msg))
+        return "; ".join(parts) if parts else "Invalid input."
+    if isinstance(exc, ValueError):
+        return str(exc)
+    msgs = extract_error_strings(exc)
+    if msgs:
+        return "; ".join(dict.fromkeys(msgs))
+    return f"{type(exc).__name__}: {exc}".strip()
+
+
+__all__ = [
+    "UploadFlowStep",
+    "build_presigned_success_payload",
+    "build_upload_error_payload",
+    "build_upload_success_payload",
+    "format_s3_upload_failure",
+    "map_upload_error_to_message",
+]

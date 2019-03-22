@@ -1,0 +1,39 @@
+"""GraphQL mutations for portal sub-portals (Internal API endpoint).
+
+These run through the Internal API executor, which accepts a ``gql()`` query like
+every other executor.
+"""
+
+from __future__ import annotations
+
+from gql import gql
+
+UPDATE_SUB_PORTAL_ELEMENT_MUTATION = gql("""
+mutation UpdateSubPortalElement($input: UpdateSubPortalElementInput!) {
+  updateSubPortalElement(input: $input) {
+    success
+  }
+}
+""")
+
+DELETE_SUB_PORTAL_ELEMENT_MUTATION = gql("""
+mutation DeleteSubPortalElement($input: DeleteSubPortalElementInput!) {
+  deleteSubPortalElement(input: $input) {
+    success
+  }
+}
+""")
+
+DELETE_SUB_PORTAL_INTERFACE_MUTATION = gql("""
+mutation DeleteSubPortalInterface($input: DeleteSubPortalInterfaceInput!) {
+  deleteSubPortalInterface(input: $input) {
+    success
+  }
+}
+""")
+
+__all__ = [
+    "DELETE_SUB_PORTAL_ELEMENT_MUTATION",
+    "DELETE_SUB_PORTAL_INTERFACE_MUTATION",
+    "UPDATE_SUB_PORTAL_ELEMENT_MUTATION",
+]

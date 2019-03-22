@@ -1,0 +1,166 @@
+[project]
+name = "pipefy-mcp-server"
+dynamic = ["version"]
+description = "MCP server that exposes Pipefy's GraphQL API."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27.0",
+    # Pinned to the 2.0 patch line rather than opened to <3, because two of the
+    # surfaces this package builds on are outside what SemVer covers: the
+    # MCPServer(middleware=[...]) list, which upstream marks provisional, and the
+    # Tool.run patch behind the argument-validation envelope. A minor release can
+    # move either with no signal, and nothing in CI resolves past the lock to
+    # catch it. Patch releases are accepted; widening to a new minor is a
+    # deliberate change that re-tests both surfaces. The floor is 2.0 because the
+    # server imports mcp.server.mcpserver, which no 1.x release has.
+    "mcp[cli]==2.0.*",
+    # Workspace resolves versions in dev; PyPI releases stage these wheels alongside CLI/MCP (see release workflow).
+    "pipefy-auth==0.5.2-beta.1",
+    "pipefy-infra==0.5.2-beta.1",
+    "pipefy==0.5.2-beta.1",
+    "pydantic>=2.13.4,<3",
+    "pydantic-settings>=2.8.1",
+    # Declared even though `mcp` already pulls it, because this package imports
+    # starlette directly: the `Starlette` return type of wire_hosted_observability,
+    # and the `Request` annotation the runtime and the identity resolvers take. An
+    # SDK release that drops or vendors starlette would break those imports with no
+    # bound to catch it. The floor is what the SDK resolves today; the `<2` cap keeps
+    # a major starlette release a deliberate upgrade, which the SDK's own floor
+    # (`starlette>=0.27` on Python < 3.14) would not.
+    "starlette>=1.3.1,<2",
+    # Declared for the same reason as starlette: `run_server` imports uvicorn and
+    # builds a `Config`/`Server` pair on the `--transport http` path. `mcp` requires
+    # it too, but under a `sys_platform != 'emscripten'` marker, so the transitive
+    # guarantee is conditional. The floor is what resolves today; the `<1` cap keeps
+    # a major uvicorn release a deliberate upgrade.
+    "uvicorn>=0.34.0,<1",
+]
+
+[tool.uv.sources]
+pipefy-auth = { workspace = true }
+pipefy-infra = { workspace = true }
+pipefy = { workspace = true }
+
+[project.scripts]
+pipefy-mcp-server = "pipefy_mcp.main:main"
+
+[dependency-groups]
+dev = [
+    "aiohttp>=3.11.16",
+    "pytest>=8.3.5",
+    "pytest-asyncio>=0.26.0",
+    "pytest-cov>=6.1.1",
+    "pytest-mock>=3.14.0",
+    "respx>=0.22.0",
+    "ruff>=0.11.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipefy_mcp"]
+
+[tool.hatch.version]
+path = "src/pipefy_mcp/__init__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `src` is the package; `../../packages/sdk/tests` supplies the `_shared` test bundle (live creds, fixtures) without putting the whole repo on sys.path.
+pythonpath = ["src", "tests", "../../packages/sdk/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --no-header --tb=short"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "module"
+markers = [
+    "unit: marks a test as a unit test",
+    "integration: marks tests that call the live Pipefy GraphQL API (PIPEFY_* env)",
+]
+filterwarnings = [
+    # Mirrors the root pyproject, which is the config CI's `uv run pytest` reads;
+    # pytest applies one config, so a package-local run needs its own copy. See the
+    # root entry for the rationale and for when to remove both.
+    "ignore:The logging capability is deprecated:mcp.shared.exceptions.MCPDeprecationWarning",
+]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+lint.extend-select = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"pipefy_cli".msg = "pipefy_mcp must not import the CLI package; keep MCP independent of pipefy-cli."
+"pipefy_sdk.services".msg = "Import from pipefy_sdk or pipefy_sdk.ai_* helpers only; pipefy_sdk.services is private to the SDK."
+"pipefy_sdk.queries".msg = "Import from pipefy_sdk only; pipefy_sdk.queries is private to the SDK."
+
+# Intra-package layering, enforced by import-linter (run `uv run lint-imports`
+# from this directory). Ruff's TID251 above guards the inter-package direction;
+# this guards the direction within pipefy_mcp. The rationale and the layer model
+# live in docs/architecture.md.
+[tool.importlinter]
+root_package = "pipefy_mcp"
+
+[[tool.importlinter.contracts]]
+name = "Inward-only layers: composition root > adapters > core > auth > settings"
+type = "layers"
+layers = [
+    "pipefy_mcp.server",
+    "pipefy_mcp.tools",
+    "pipefy_mcp.core",
+    "pipefy_mcp.auth",
+    "pipefy_mcp.settings",
+]
+
+# Hosted per-user safety (#306): settings reachable from the tool layer are
+# process-global — under the remote profile they are shared across concurrent
+# callers, so such a read may only ever make a per-deployment decision, and each
+# one is reviewed onto ignore_imports (direct or via a core helper; the contract
+# checks transitive chains). The line and its rationale live in CLAUDE.md
+# ("Process-global configuration and the single-backend assumption").
+[[tool.importlinter.contracts]]
+name = "Tools read no process-global settings"
+type = "forbidden"
+source_modules = ["pipefy_mcp.tools"]
+forbidden_modules = ["pipefy_mcp.settings"]
+ignore_imports = [
+    # Reviewed: permission_denied_enrichment_timeout_seconds, a deployment
+    # tuning knob, not a per-user decision.
+    "pipefy_mcp.tools.graphql_error_helpers -> pipefy_mcp.settings",
+    # Reviewed: unified_envelope, a per-deployment response-shape flag applied
+    # identically to every caller.
+    "pipefy_mcp.core.tool_error_envelope -> pipefy_mcp.settings",
+    # Reviewed: the composition root builds the runtime from settings at
+    # startup. The runtime holds no Settings tree — it exposes only the two
+    # curated per-deployment booleans it resolves at construction (is_remote,
+    # unified_envelope), never settings.* — so tool code reaching the runtime
+    # off the lifespan context has no import-free path to the Settings tree
+    # (#405). Reviewed per-deployment reads elsewhere still go through the
+    # import exceptions listed here.
+    "pipefy_mcp.core.runtime -> pipefy_mcp.settings",
+    # Reviewed: imports the Settings type for startup identity resolution.
+    # StartupIdentity receives settings from the composition root and
+    # RequestScopedIdentity resolves from the request bearer — no call-time
+    # global read. Reached transitively via core.runtime.
+    "pipefy_mcp.auth.session_identity -> pipefy_mcp.settings",
+    # Reviewed: reads McpSettings.host and the transport allowlist at startup
+    # for bind-safety / DNS-rebinding config — per-deployment, not a per-user
+    # decision. Reached transitively via core.runtime.
+    "pipefy_mcp.core.transport_security -> pipefy_mcp.settings",
+]
+
+# Next ratchet (disabled): lock the domain as framework-free once it has a home.
+# The pure domain is still scattered: the error/success envelope lives in
+# core/tool_error_envelope.py and the payload builders under tools/, with no single
+# framework-free module to lock yet. When it moves into a dedicated module, set
+# `include_external_packages = true` on
+# [tool.importlinter] above and enable a forbidden contract so the domain cannot
+# import the MCP SDK, Starlette, or the vendor SDK:
+#
+# [[tool.importlinter.contracts]]
+# name = "Domain stays framework-free"
+# type = "forbidden"
+# source_modules = ["pipefy_mcp.domain"]
+# forbidden_modules = ["mcp", "starlette", "pipefy_sdk"]

@@ -1,0 +1,229 @@
+"""Single source of truth for the Pipefy credential precedence chain.
+
+The chain is a fixed three-slot tuple — consumers do not extend it:
+
+1. ``static-token`` — a pre-resolved bearer (consumers collapse their own
+   surfaces — CLI ``--token`` flag, ``PIPEFY_TOKEN`` env var — into one value).
+2. ``service-account`` — OAuth2 client-credentials grant.
+3. ``stored-session`` — keychain session populated by ``pipefy auth login``.
+
+The flag-vs-env distinction the CLI surfaces in ``pipefy auth status`` is a
+display concern handled in CLI code, not an auth method here.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from typing import assert_never
+
+from httpx import Auth
+from httpx_auth import OAuth2ClientCredentials
+
+from pipefy_auth.bearer import (
+    RefreshableBearerAuth,
+    StaticBearerAuth,
+)
+from pipefy_auth.identity import OidcClient
+from pipefy_auth.refresh import RefreshError, ensure_fresh_session
+from pipefy_auth.storage import load_session
+
+
+@dataclass(frozen=True)
+class ServiceAccount:
+    """OAuth2 client-credentials inputs for the service-account auth method."""
+
+    token_url: str
+    client_id: str
+    client_secret: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class StaticTokenAuth:
+    """Resolved static-token method: a pre-issued bearer, stripped and non-blank."""
+
+    token: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class ServiceAccountAuth:
+    """Resolved service-account method: the OAuth2 client-credentials inputs."""
+
+    credentials: ServiceAccount
+
+
+@dataclass(frozen=True)
+class StoredSessionAuth:
+    """Resolved stored-session method: the OIDC client whose keychain session was found.
+
+    ``oidc_client`` is non-None by construction: :func:`resolve_pipefy_auth` only
+    builds this variant once a keychain session is present, so consumers reach it
+    without a further presence check.
+    """
+
+    oidc_client: OidcClient
+
+
+# The credential precedence chain, parsed into the auth method that won:
+# :func:`resolve_pipefy_auth` produces it, :func:`build_httpx_auth` consumes it.
+ResolvedAuth = StaticTokenAuth | ServiceAccountAuth | StoredSessionAuth
+
+
+def _stored_session_provider(oidc_client: OidcClient) -> RefreshableBearerAuth:
+    def _token() -> str:
+        session = ensure_fresh_session(
+            issuer=oidc_client.issuer_url, client_id=oidc_client.client_id
+        )
+        if session is None:
+            raise RuntimeError(
+                "Stored Pipefy session was removed; run `pipefy auth login` again."
+            )
+        return session.token.access_token
+
+    def _force_refresh() -> str | None:
+        try:
+            session = ensure_fresh_session(
+                issuer=oidc_client.issuer_url,
+                client_id=oidc_client.client_id,
+                force=True,
+            )
+        except RefreshError:
+            return None
+        return session.token.access_token if session is not None else None
+
+    return RefreshableBearerAuth(token_provider=_token, force_refresh=_force_refresh)
+
+
+def _has_stored_session(oidc_client: OidcClient) -> bool:
+    return (
+        load_session(issuer=oidc_client.issuer_url, client_id=oidc_client.client_id)
+        is not None
+    )
+
+
+def _detected_methods(
+    *,
+    static_token: str | None,
+    service_account: ServiceAccount | None,
+    oidc_client: OidcClient | None,
+) -> Iterator[ResolvedAuth]:
+    """Yield each configured auth method, highest precedence first.
+
+    The single source of both precedence order and per-method gate logic:
+    :func:`resolve_pipefy_auth` takes the first item, :func:`detect_pipefy_auth_methods`
+    takes them all. Lazy by design, so ``resolve``'s short-circuit falls out of
+    generator suspension: pulling only the first item stops the body at that
+    ``yield``, leaving lower gates (including the stored-session keychain read)
+    unevaluated.
+    """
+    if static_token and static_token.strip():
+        yield StaticTokenAuth(static_token.strip())
+    if service_account is not None:
+        yield ServiceAccountAuth(service_account)
+    if oidc_client is not None and _has_stored_session(oidc_client):
+        yield StoredSessionAuth(oidc_client)
+
+
+def resolve_pipefy_auth(
+    *,
+    static_token: str | None = None,
+    service_account: ServiceAccount | None = None,
+    oidc_client: OidcClient | None = None,
+) -> ResolvedAuth | None:
+    """Parse the available credentials into the highest-precedence auth method.
+
+    Short-circuits at the first method that resolves; lower-precedence methods
+    are never inspected. The returned :data:`ResolvedAuth` variant carries the
+    method's identity in its type; pass it to :func:`build_httpx_auth` to obtain
+    the transport's ``httpx.Auth``.
+
+    For an enumeration of every detected auth method (e.g. for diagnostics),
+    call :func:`detect_pipefy_auth_methods` instead. The two share
+    :func:`_detected_methods`, so this always equals that function's first entry.
+
+    Args:
+        static_token: Pre-resolved bearer for the static-token method. Consumers
+            collapse their own per-source precedence (e.g. CLI ``--token`` flag
+            vs ``PIPEFY_TOKEN`` env var) into one value before calling.
+        service_account: Service-account client-credentials inputs.
+        oidc_client: OIDC client identity for the stored-session method; the
+            session is loaded from the keychain at detection time.
+    """
+    return next(
+        _detected_methods(
+            static_token=static_token,
+            service_account=service_account,
+            oidc_client=oidc_client,
+        ),
+        None,
+    )
+
+
+def build_httpx_auth(resolved: ResolvedAuth) -> Auth:
+    """Construct the ``httpx.Auth`` for an already-resolved auth method.
+
+    Total over :data:`ResolvedAuth`: the "no credentials" case is decided once,
+    in :func:`resolve_pipefy_auth`, so this function has no ``None`` branch. The
+    stored-session method fetches a fresh access token per request via
+    :class:`pipefy_auth.bearer.RefreshableBearerAuth`, which also forces a
+    refresh + retry on a 401 response.
+    """
+    match resolved:
+        case StaticTokenAuth(token):
+            return StaticBearerAuth(token)
+        case ServiceAccountAuth(credentials):
+            return OAuth2ClientCredentials(
+                token_url=credentials.token_url,
+                client_id=credentials.client_id,
+                client_secret=credentials.client_secret,
+            )
+        case StoredSessionAuth(oidc_client):
+            return _stored_session_provider(oidc_client)
+        case _:
+            assert_never(resolved)
+
+
+def detect_pipefy_auth_methods(
+    *,
+    static_token: str | None = None,
+    service_account: ServiceAccount | None = None,
+    oidc_client: OidcClient | None = None,
+) -> list[ResolvedAuth]:
+    """Return every auth method with credentials available, precedence-first.
+
+    The non-short-circuiting sibling of :func:`resolve_pipefy_auth`: it parses
+    each configured method into the same :data:`ResolvedAuth` variant rather
+    than stopping at the winner, so ``pipefy auth status`` can surface masked
+    methods alongside the active one. Runs every method's detection, including
+    the keychain read for the stored-session method. The first entry is always
+    the method :func:`resolve_pipefy_auth` returns; both draw from
+    :func:`_detected_methods`.
+    """
+    return list(
+        _detected_methods(
+            static_token=static_token,
+            service_account=service_account,
+            oidc_client=oidc_client,
+        )
+    )
+
+
+def missing_auth_message(*, login_command: str = "pipefy auth login") -> str:
+    """Canonical "no auth configured" message; consumers append their own context."""
+    return (
+        "Missing Pipefy authentication. Set PIPEFY_TOKEN, configure "
+        f"PIPEFY_SERVICE_ACCOUNT_*, or run `{login_command}`."
+    )
+
+
+__all__ = [
+    "ResolvedAuth",
+    "ServiceAccount",
+    "ServiceAccountAuth",
+    "StaticTokenAuth",
+    "StoredSessionAuth",
+    "build_httpx_auth",
+    "detect_pipefy_auth_methods",
+    "missing_auth_message",
+    "resolve_pipefy_auth",
+]

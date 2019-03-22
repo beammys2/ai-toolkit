@@ -1,0 +1,1501 @@
+"""MCP tools for pipes, cards, comments, and related operations."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.shared.exceptions import NoBackChannelError
+from mcp.types import ToolAnnotations
+from pipefy_sdk import (
+    CardSearch,
+    CommentInput,
+    DeleteCommentInput,
+    PipefyId,
+    UpdateCommentInput,
+    copy_card_search,
+    create_form_model,
+)
+from pipefy_sdk import (
+    filter_editable_field_definitions as _filter_editable_field_definitions,
+)
+from pipefy_sdk import (
+    filter_fields_by_definitions as _filter_fields_by_definitions,
+)
+from pipefy_sdk.models.form import MalformedFieldDefinitionError
+from pydantic import ValidationError
+
+from pipefy_mcp.core.tool_error_envelope import (
+    is_unified_envelope_enabled,
+    tool_error,
+    tool_error_message,
+    tool_success,
+)
+from pipefy_mcp.tools.destructive_tool_guard import check_destructive_confirmation
+from pipefy_mcp.tools.graphql_error_helpers import (
+    enrich_permission_denied_error,
+    ensure_non_empty_error_message,
+    extract_graphql_correlation_id,
+    extract_graphql_error_codes,
+    handle_tool_graphql_error,
+    with_debug_suffix,
+)
+from pipefy_mcp.tools.mcp_capabilities import supports_elicitation
+from pipefy_mcp.tools.pagination_helpers import (
+    build_pagination_info,
+    validate_page_size,
+)
+from pipefy_mcp.tools.phase_transition_helpers import (
+    try_enrich_move_card_to_phase_failure,
+    try_enrich_required_field_move_failure,
+)
+from pipefy_mcp.tools.pipe_tool_helpers import (
+    FIND_CARDS_EMPTY_MESSAGE,
+    AddCardCommentPayload,
+    DeleteCardPayload,
+    DeleteCommentPayload,
+    UpdateCommentPayload,
+    UserCancelledError,
+    _merge_phase_and_start_form_field_values,
+    build_add_card_comment_error_payload,
+    build_add_card_comment_success_payload,
+    build_delete_card_error_payload,
+    build_delete_card_success_payload,
+    build_delete_comment_error_payload,
+    build_delete_comment_success_payload,
+    build_update_comment_error_payload,
+    build_update_comment_success_payload,
+    map_add_card_comment_error_to_message,
+    map_delete_card_error_to_message,
+    map_delete_comment_error_to_message,
+    map_update_comment_error_to_message,
+    message_for_add_card_comment_validation_error,
+)
+from pipefy_mcp.tools.relation_tool_helpers import (
+    build_relation_error_payload,
+    build_relation_mutation_success_payload,
+    handle_relation_tool_graphql_error,
+)
+from pipefy_mcp.tools.remote_profile import REMOTE
+from pipefy_mcp.tools.tool_context import get_pipefy_client
+from pipefy_mcp.tools.validation_helpers import validate_tool_id
+
+# Key for findCards response; used when reading edges and adding empty message.
+FIND_CARDS_RESPONSE_KEY = "findCards"
+
+
+class PipeTools:
+    """Declares tools to be used in the Pipe context."""
+
+    @staticmethod
+    def register(mcp: MCPServer) -> None:
+        """Register the tools in the MCP server"""
+
+        @mcp.tool(
+            annotations=ToolAnnotations(readOnlyHint=False),
+            meta=REMOTE,
+        )
+        async def create_card(
+            ctx: Context,
+            pipe_id: PipefyId,
+            title: str | None = None,
+            fields: dict[str, Any] | None = None,
+            required_fields_only: bool = False,
+            skip_elicitation: bool = False,
+            phase_id: PipefyId | None = None,
+        ) -> dict:
+            """Create a card in the pipe.
+
+            When ``skip_elicitation`` is True, field values from ``fields`` are
+            filtered to editable field IDs and sent directly to the API — no
+            interactive form is shown. AI agents should set this to True when
+            they already know the field values.
+
+            When ``skip_elicitation`` is False (default) and the client supports
+            elicitation, an interactive form is presented even if ``fields``
+            carries pre-filled values — the human can review and adjust them.
+
+            On ambiguous failure (empty or unclear ``error.message``), re-read
+            ``get_cards`` / ``get_phase_cards_count`` before retrying; do not
+            blind-retry creates (``CreateCardInput`` has no ``idempotency_key``).
+
+            A form is only possible when the connection can carry a
+            server-to-client request. It cannot on protocol revision 2026-07-28,
+            on a stateless HTTP transport, or on a deployment serving
+            ``json_response=True`` (which the hosted server does). There the tool
+            takes the ``skip_elicitation`` path instead, without saying so in the
+            result: ``fields`` is sent as given, so an omitted ``fields`` sends no
+            values at all and the API decides whether its required fields were
+            satisfied. A caller that cannot be sure of the client's channel should
+            discover the fields first and pass every required value.
+
+            Without ``phase_id``, discover start-form fields via
+            ``get_start_form_fields`` and pass all required values.
+
+            With ``phase_id``, the card is created in that phase (including orphan
+            phases that are not the start form). Discover workflow phase IDs via
+            ``get_pipe(pipe_id).phases[].id``. For agent seeding in a specific phase, set
+            ``phase_id`` and ``skip_elicitation=true``. When ``fields`` is non-empty,
+            keys are filtered against ``get_phase_fields(phase_id)`` and
+            ``get_start_form_fields(pipe_id)`` so pipes that still require start-form
+            values on ``CreateCardInput`` receive them alongside phase fields.
+
+            If you plan to move the card afterwards, call
+            ``get_phase_allowed_move_targets`` on the card's current phase before
+            ``move_card_to_phase`` — only phases allowed by the workflow can be used.
+
+            ``title`` is sent on ``CreateCardInput`` when provided.
+
+            When the pipe uses Pipefy's default of deriving the card title from the
+            first text-like start-form field, a later ``update_card_field`` on that
+            field can still change the displayed title; do not assume ``title`` stays
+            fixed if fields are edited afterwards.
+
+            Args:
+                pipe_id: The ID of the pipe where the card will be created.
+                    Discover via: ``search_pipes`` or ``get_organization``.
+                title: Optional card title. Passed on CreateCardInput when set.
+                fields: A dictionary of fields that can be pre-filled on the card.
+                    When ``skip_elicitation`` is False, these pre-fill the interactive
+                    form. When True, they are sent directly to the API.
+                required_fields_only: If True, only elicit required fields. Default: False.
+                skip_elicitation: When True, bypass interactive elicitation and send
+                    ``fields`` directly to the API. Recommended for AI agent workflows.
+                phase_id: Optional target phase ID. Interactive elicitation prompts
+                    start-form fields (matching the Pipefy UI); phase field values are
+                    merged from ``fields`` when provided. For agent seeding, set
+                    ``skip_elicitation=true``. Discover via: ``get_pipe(pipe_id).phases[].id``.
+            """
+            client = get_pipefy_client(ctx)
+            card_data = fields or {}
+            can_elicit = supports_elicitation(ctx)
+            if not can_elicit and not skip_elicitation:
+                # Logged for the same reason the NoBackChannelError absorb in
+                # _elicit_field_details logs: a caller asked for a form and the
+                # result cannot say it never appeared.
+                await ctx.debug(
+                    "Elicitation unavailable: no interactive form for this "
+                    "connection; proceeding with the supplied fields"
+                )
+            # Stays None when elicitation is skipped or the connection turns out
+            # to have no back channel; either way the supplied fields are used.
+            elicited: dict[str, Any] | None = None
+
+            if phase_id is not None:
+                phase_id_str, phase_err = validate_tool_id(phase_id, "phase_id")
+                if phase_err is not None:
+                    return phase_err
+                phase_id = phase_id_str
+                try:
+                    phase_fields_result = await client.get_phase_fields(
+                        phase_id, required_fields_only
+                    )
+                except MalformedFieldDefinitionError as exc:
+                    return tool_error(str(exc))
+                phase_field_defs = _filter_editable_field_definitions(
+                    phase_fields_result.get("fields", [])
+                )
+                try:
+                    form_fields = await client.get_start_form_fields(
+                        pipe_id, required_fields_only
+                    )
+                except MalformedFieldDefinitionError as exc:
+                    return tool_error(str(exc))
+                start_form_field_defs = _filter_editable_field_definitions(
+                    form_fields.get("start_form_fields", [])
+                )
+                await ctx.debug(
+                    f"Expected phase fields for {phase_id}: {phase_field_defs}"
+                )
+                await ctx.debug(
+                    f"Expected start-form fields for pipe {pipe_id}: "
+                    f"{start_form_field_defs}"
+                )
+                await ctx.debug(f"Provided fields: {fields}")
+
+                if can_elicit and start_form_field_defs and not skip_elicitation:
+                    try:
+                        elicited = await PipeTools._elicit_field_details(
+                            message=(
+                                f"Creating a card in phase {phase_id} (pipe {pipe_id})"
+                            ),
+                            prefilled_fields=fields,
+                            expected_fields=start_form_field_defs,
+                            ctx=ctx,
+                        )
+                    except MalformedFieldDefinitionError as exc:
+                        return tool_error(str(exc))
+                    except UserCancelledError:
+                        return tool_error("Card creation cancelled by user.")
+
+                if elicited is not None:
+                    merged_source = {**(fields or {}), **elicited}
+                    card_data = _merge_phase_and_start_form_field_values(
+                        merged_source,
+                        phase_field_definitions=phase_field_defs,
+                        start_form_field_definitions=start_form_field_defs,
+                    )
+                elif phase_field_defs or start_form_field_defs:
+                    card_data = _merge_phase_and_start_form_field_values(
+                        card_data,
+                        phase_field_definitions=phase_field_defs,
+                        start_form_field_definitions=start_form_field_defs,
+                    )
+            else:
+                try:
+                    form_fields = await client.get_start_form_fields(
+                        pipe_id, required_fields_only
+                    )
+                except MalformedFieldDefinitionError as exc:
+                    return tool_error(str(exc))
+
+                expected_fields = _filter_editable_field_definitions(
+                    form_fields.get("start_form_fields", [])
+                )
+
+                await ctx.debug(
+                    f"Expected fields for pipe {pipe_id}: {expected_fields}"
+                )
+                await ctx.debug(f"Provided fields: {fields}")
+
+                if can_elicit and not skip_elicitation:
+                    try:
+                        elicited = await PipeTools._elicit_field_details(
+                            message=f"Creating a card in pipe {pipe_id}",
+                            prefilled_fields=fields,
+                            expected_fields=expected_fields,
+                            ctx=ctx,
+                        )
+                    except MalformedFieldDefinitionError as exc:
+                        return tool_error(str(exc))
+                    except UserCancelledError:
+                        return tool_error("Card creation cancelled by user.")
+
+                if elicited is not None:
+                    card_data = elicited
+                elif expected_fields:
+                    card_data = _filter_fields_by_definitions(
+                        card_data, expected_fields
+                    )
+
+            create_kwargs: dict[str, Any] = {}
+            if phase_id is not None:
+                create_kwargs["phase_id"] = phase_id
+            if title:
+                create_kwargs["title"] = title
+
+            try:
+                result = await client.create_card(pipe_id, card_data, **create_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                perm_msg = await enrich_permission_denied_error(
+                    exc, [str(pipe_id)], client
+                )
+                error_text = str(exc)
+                if perm_msg:
+                    error_text = f"{perm_msg}\n{error_text}"
+                return tool_error(
+                    ensure_non_empty_error_message(
+                        error_text,
+                        "Failed to create card. Re-read get_cards or "
+                        "get_phase_cards_count before retrying; do not blind-retry.",
+                    )
+                )
+            card_data_node = (result.get("createCard") or {}).get("card")
+            card_id = (
+                card_data_node.get("id") if isinstance(card_data_node, dict) else None
+            )
+            if card_id:
+                if title:
+                    if card_data_node is not None:
+                        if card_data_node.get("title") != title:
+                            result["title_warning"] = (
+                                "Card created but title was not applied as expected "
+                                f"(response title={card_data_node.get('title')!r}, "
+                                f"requested={title!r})."
+                            )
+                card_url = f"https://app.pipefy.com/open-cards/{card_id}"
+                result["card_link"] = f"[{card_url}]({card_url})"
+            return result
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def get_card(
+            ctx: Context,
+            card_id: PipefyId,
+            include_fields: bool = False,
+            debug: bool = False,
+        ) -> dict:
+            """Load one card by ID for title, current phase, pipe, and optional field values.
+
+            Use this to inspect a card before updates, after ``find_cards`` / ``get_cards``,
+            or when the user references a card by ID. Set ``include_fields`` when you need
+            custom field ``name``/``value`` pairs for forms or automation.
+
+            Does not return labels or assignees. Those are card attributes, not ``fields``.
+            Read current label ids via ``execute_graphql`` (``card(id: ...) { labels { id } }``)
+            before ``update_card(label_ids=...)``.
+
+            Args:
+                card_id: Pipefy card ID (string or positive integer).
+                    Discover via: ``find_cards`` or ``get_cards(pipe_id)``.
+                include_fields: If True, include each custom field's name and value on the card node.
+                debug: When True, append GraphQL codes and correlation_id on errors.
+
+            Returns:
+                dict: GraphQL ``card`` payload with ``id``, ``uuid``, ``title``, ``pipe``,
+                ``current_phase``, and—when ``include_fields`` is true—``fields``.
+            """
+            client = get_pipefy_client(ctx)
+            await ctx.debug(f"get_card: card_id={card_id}")
+            card_id_str, err = validate_tool_id(card_id, "card_id")
+            if err is not None:
+                return err
+            try:
+                return await client.get_card(card_id_str, include_fields=include_fields)
+            except Exception as exc:  # noqa: BLE001
+                return handle_tool_graphql_error(
+                    exc,
+                    "Failed to load card.",
+                    debug=debug,
+                    resource_kind="card",
+                    resource_id=card_id_str,
+                )
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def get_card_relations(
+            ctx: Context,
+            card_id: PipefyId,
+            debug: bool = False,
+        ) -> dict:
+            """List parent and child card relations for a card (full lists; no pagination).
+
+            Use after ``get_card`` or ``find_cards`` when you need linked cards in other pipes.
+            ``child_relations`` and ``parent_relations`` mirror Pipefy's relation groups (name,
+            pipe, linked cards).
+
+            Args:
+                card_id: Card whose relations to load.
+                debug: When True, append GraphQL codes and correlation_id on errors.
+
+            Returns:
+                On success: ``success``, ``message``, ``child_relations``, and ``parent_relations``
+                (API fields ``child_relations`` / ``parent_relations`` on ``Card``). On failure:
+                ``success: False`` and ``error``.
+            """
+            client = get_pipefy_client(ctx)
+            await ctx.debug(f"get_card_relations: card_id={card_id}")
+            card_id_str, err = validate_tool_id(card_id, "card_id")
+            if err is not None:
+                return err
+
+            try:
+                raw = await client.get_card_relations(card_id_str)
+            except Exception as exc:  # noqa: BLE001
+                return handle_relation_tool_graphql_error(
+                    exc,
+                    "Get card relations failed.",
+                    debug=debug,
+                    resource_kind="card",
+                    resource_id=card_id_str,
+                )
+
+            card_node = raw.get("card")
+            if card_node is None:
+                return tool_error("Card not found or access denied.")
+
+            # Public GraphQL returns snake_case (``child_relations``); accept camelCase too.
+            child = (
+                card_node.get("child_relations")
+                or card_node.get("childRelations")
+                or []
+            )
+            parent = (
+                card_node.get("parent_relations")
+                or card_node.get("parentRelations")
+                or []
+            )
+            return {
+                "success": True,
+                "message": "Card relations loaded.",
+                "child_relations": child,
+                "parent_relations": parent,
+            }
+
+        @mcp.tool(
+            annotations=ToolAnnotations(readOnlyHint=False),
+            structured_output=False,
+            meta=REMOTE,
+        )
+        async def add_card_comment(
+            card_id: PipefyId, text: str, ctx: Context
+        ) -> AddCardCommentPayload:
+            """Add a text comment to a Pipefy card.
+
+            Args:
+                card_id: The ID of the card to comment on
+                text: The comment text to post (1-1000 characters)
+            """
+            client = get_pipefy_client(ctx)
+            # Privacy: never log the full comment text (it may contain sensitive data).
+            try:
+                comment_input = CommentInput(card_id=card_id, text=text)
+            except ValidationError as exc:
+                return build_add_card_comment_error_payload(
+                    message=message_for_add_card_comment_validation_error(
+                        exc, raw_text=text
+                    ),
+                    code="INVALID_ARGUMENTS",
+                )
+
+            try:
+                response = await client.add_card_comment(
+                    card_id=comment_input.card_id, text=comment_input.text
+                )
+                comment_id = response["createComment"]["comment"]["id"]
+            except Exception as exc:  # noqa: BLE001
+                return build_add_card_comment_error_payload(
+                    message=map_add_card_comment_error_to_message(exc)
+                )
+
+            return build_add_card_comment_success_payload(comment_id=comment_id)
+
+        @mcp.tool(
+            annotations=ToolAnnotations(readOnlyHint=False),
+            structured_output=False,
+            meta=REMOTE,
+        )
+        async def update_comment(
+            comment_id: PipefyId, text: str, ctx: Context
+        ) -> UpdateCommentPayload:
+            """Update an existing comment by its ID.
+
+            Args:
+                comment_id: The ID of the comment to update.
+                text: The new comment text (1-1000 characters).
+            """
+            client = get_pipefy_client(ctx)
+            # Privacy: do not log full comment text.
+            try:
+                update_input = UpdateCommentInput(comment_id=comment_id, text=text)
+            except ValidationError:
+                return build_update_comment_error_payload(
+                    message="Invalid input. Please provide a valid 'comment_id' and non-empty 'text'.",
+                    code="INVALID_ARGUMENTS",
+                )
+
+            try:
+                response = await client.update_comment(
+                    update_input.comment_id, update_input.text
+                )
+                comment_id_out = response["updateComment"]["comment"]["id"]
+            except Exception as exc:  # noqa: BLE001
+                return build_update_comment_error_payload(
+                    message=map_update_comment_error_to_message(exc)
+                )
+
+            return build_update_comment_success_payload(comment_id=comment_id_out)
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=True,
+            ),
+            structured_output=False,
+            meta=REMOTE,
+        )
+        async def delete_comment(
+            ctx: Context,
+            comment_id: PipefyId,
+            confirm: bool = False,
+            confirmation_token: str | None = None,
+        ) -> DeleteCommentPayload:
+            """Delete a comment from Pipefy.
+
+            Two-step operation: preview with ``confirm=False`` (default), then echo
+            ``confirmation_token`` from the preview on step 2.
+
+            Args:
+                comment_id: The ID of the comment to delete.
+                confirm: Set to True with the preview token to execute the deletion (step 2).
+                confirmation_token: Token from the preview response.
+            """
+            client = get_pipefy_client(ctx)
+            try:
+                delete_input = DeleteCommentInput(comment_id=comment_id)
+            except ValidationError:
+                return build_delete_comment_error_payload(
+                    message="Invalid input. Please provide a valid 'comment_id'.",
+                    code="INVALID_ARGUMENTS",
+                )
+
+            guard = await check_destructive_confirmation(
+                ctx,
+                confirm=confirm,
+                resource_descriptor=f"comment (ID: {delete_input.comment_id})",
+                resource_identity={"comment_id": delete_input.comment_id},
+                tool_name="delete_comment",
+                confirmation_token=confirmation_token,
+            )
+            if guard is not None:
+                return guard
+
+            try:
+                await client.delete_comment(delete_input.comment_id)
+            except Exception as exc:  # noqa: BLE001
+                return build_delete_comment_error_payload(
+                    message=map_delete_comment_error_to_message(exc)
+                )
+
+            return build_delete_comment_success_payload()
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def delete_card_relation(
+            ctx: Context,
+            child_id: PipefyId,
+            parent_id: PipefyId,
+            source_id: PipefyId,
+            confirm: bool = False,
+            confirmation_token: str | None = None,
+            debug: bool = False,
+        ) -> dict:
+            """Remove a link between two related cards.
+
+            ``source_id`` is the **pipe relation** id from ``get_pipe_relations`` (same as
+            ``create_card_relation``). Echo ``confirmation_token`` from the preview on step 2.
+
+            The ``deleteCardRelation`` mutation is only available on the Internal API,
+            not the public GraphQL schema; it runs with the session's credential like
+            every other tool.
+
+            Args:
+                child_id: Child card ID in the relation.
+                parent_id: Parent card ID in the relation.
+                source_id: Pipe relation ID defining the pipe-to-pipe link.
+                confirm: Set to True with the preview token to execute the deletion (step 2).
+                confirmation_token: Token from the preview response.
+                debug: When True, append GraphQL codes and correlation_id to errors.
+
+            Returns:
+                Success payload with mutation result, or ``success: False`` with ``error``.
+            """
+            client = get_pipefy_client(ctx)
+            await ctx.debug(
+                f"delete_card_relation: child_id={child_id}, parent_id={parent_id}, "
+                f"source_id={source_id}, confirm={confirm}"
+            )
+
+            cid, err = validate_tool_id(child_id, "child_id")
+            if err is not None:
+                return err
+            pid, err = validate_tool_id(parent_id, "parent_id")
+            if err is not None:
+                return err
+            sid, err = validate_tool_id(source_id, "source_id")
+            if err is not None:
+                return err
+
+            guard = await check_destructive_confirmation(
+                ctx,
+                confirm=confirm,
+                resource_descriptor=(
+                    f"card relation (child: {cid}, parent: {pid}, source: {sid})"
+                ),
+                resource_identity={
+                    "child_id": cid,
+                    "parent_id": pid,
+                    "source_id": sid,
+                },
+                tool_name="delete_card_relation",
+                confirmation_token=confirmation_token,
+            )
+            if guard is not None:
+                return guard
+
+            try:
+                raw = await client.delete_card_relation(cid, pid, sid)
+            except Exception as exc:  # noqa: BLE001
+                return handle_relation_tool_graphql_error(
+                    exc,
+                    "Delete card relation failed.",
+                    debug=debug,
+                    resource_kind="card",
+                    resource_id=str(cid),
+                )
+
+            node = raw.get("deleteCardRelation") or {}
+            if node.get("success"):
+                return build_relation_mutation_success_payload(
+                    message="Card relation removed.",
+                    data=raw,
+                )
+            return build_relation_error_payload(
+                message="Delete card relation did not succeed.",
+            )
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def get_cards(
+            ctx: Context,
+            pipe_id: PipefyId,
+            title: str | None = None,
+            search: CardSearch | None = None,
+            include_fields: bool = False,
+            first: int | None = None,
+            after: str | None = None,
+        ) -> dict:
+            """Get cards in the pipe with optional search and pagination.
+
+            Supports searching by card **title** (use the ``title`` shortcut) as well
+            as by assignees, labels, and other attributes via ``search``.
+
+            Use ``first`` and ``after`` (from ``pageInfo.endCursor``) to paginate
+            through large result sets. Without pagination params, returns the API
+            default page.
+
+            Args:
+                pipe_id: The ID of the pipe.
+                title: Filter cards whose title contains this text. Convenience
+                    shortcut — merged into ``search`` automatically.
+                search: Optional search filters (title, assignee_ids, label_ids,
+                    include_done, etc.). See ``CardSearch`` for all supported keys.
+                include_fields: If True, include each card's custom fields (name, value) in the response.
+                first: Max cards to return per page (1-500).
+                after: Cursor for fetching the next page (from ``pageInfo.endCursor`` of a previous call).
+            """
+            client = get_pipefy_client(ctx)
+            if first is not None:
+                validated_first, err = validate_page_size(first)
+                if err is not None:
+                    return err
+                first = validated_first
+
+            merged_search: CardSearch = copy_card_search(search) if search else {}
+            if title:
+                merged_search["title"] = title
+
+            effective_search: CardSearch | None = (
+                merged_search if merged_search else None
+            )
+
+            await ctx.debug(
+                f"Getting cards for pipe {pipe_id} (include_fields={include_fields}, search={effective_search})"
+            )
+            raw = await client.get_cards(
+                pipe_id,
+                effective_search,
+                include_fields=include_fields,
+                first=first,
+                after=after,
+            )
+            if is_unified_envelope_enabled():
+                pagination = None
+                if first is not None:
+                    page_info = (
+                        (raw.get("cards") or {}).get("pageInfo")
+                        if isinstance(raw, dict)
+                        else None
+                    )
+                    pagination = build_pagination_info(
+                        page_info=page_info, page_size=first
+                    )
+                return tool_success(
+                    data=raw, message="Cards retrieved.", pagination=pagination
+                )
+            return raw
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def find_cards(
+            pipe_id: PipefyId,
+            field_id: str,
+            field_value: str,
+            ctx: Context,
+            include_fields: bool = False,
+            first: int | None = None,
+            after: str | None = None,
+            debug: bool = False,
+        ) -> dict:
+            """Find cards in the pipe where a specific custom field equals a given value.
+
+            Use this when you need to filter cards by a **custom field** value
+            (e.g. Status = "In Progress"). This tool does **not** support
+            searching by card title — use ``get_cards(title=...)`` for that.
+
+            Do **not** use column ``name`` values from ``get_pipe_report_columns`` or
+            ``get_pipe_report_filterable_fields`` (e.g. ``field_2_string``) as ``field_id``:
+            those keys are for pipe **reports**, not for the ``findCards`` GraphQL field.
+            Always take ``field_id`` from ``get_phase_fields`` or ``get_start_form_fields``
+            (the field's ``id`` / slug).
+
+            Args:
+                pipe_id: The ID of the pipe to search in.
+                field_id: Pipefy field slug (e.g. "status", "campaign_name") — the ``id``
+                    value returned by get_start_form_fields or get_phase_fields, NOT the
+                    human-readable label and NOT pipe-report column names. Call
+                    get_phase_fields (per phase) or get_start_form_fields to discover valid slugs.
+                field_value: Value to match for that field (string; use the format expected by the field type).
+                include_fields: If True, include each card's custom fields (name, value) in the response.
+                first: Max cards per page (optional).
+                after: Cursor from ``pageInfo.endCursor`` for the next page (optional).
+                debug: When True, append GraphQL codes and correlation_id on errors.
+            """
+            client = get_pipefy_client(ctx)
+            try:
+                response = await client.find_cards(
+                    pipe_id,
+                    field_id,
+                    field_value,
+                    include_fields=include_fields,
+                    first=first,
+                    after=after,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return handle_tool_graphql_error(
+                    exc,
+                    "Find cards failed.",
+                    debug=debug,
+                    resource_kind="phase_field",
+                )
+            edges = response.get(FIND_CARDS_RESPONSE_KEY, {}).get("edges")
+            if not edges:
+                response = dict(response)
+                response["message"] = FIND_CARDS_EMPTY_MESSAGE
+            return response
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def get_pipe(
+            ctx: Context,
+            pipe_id: PipefyId,
+            debug: bool = False,
+        ) -> dict:
+            """Load a pipe by ID: name, phases, labels, and start-form field definitions.
+
+            Use this after resolving ``pipe_id`` (e.g. from ``search_pipes``) to inspect workflow
+            structure, obtain phase IDs for ``move_card_to_phase``, or read start-form fields
+            before ``create_card``.
+
+            Args:
+                pipe_id: Pipe identifier (string or positive integer).
+                    Discover via: ``search_pipes`` or ``get_organization``.
+                debug: When True, append GraphQL codes and correlation_id on errors.
+
+            Returns:
+                dict: GraphQL response containing a ``pipe`` object with ``id``, ``name``,
+                ``phases`` (workflow phases; each includes ``cards_count``),
+                ``labels``, ``start_form_fields``, and related metadata from the API.
+            """
+            client = get_pipefy_client(ctx)
+            await ctx.debug(f"get_pipe: pipe_id={pipe_id}")
+            pipe_id_str, err = validate_tool_id(pipe_id, "pipe_id")
+            if err is not None:
+                return err
+            try:
+                return await client.get_pipe(pipe_id_str)
+            except Exception as exc:  # noqa: BLE001
+                return handle_tool_graphql_error(
+                    exc,
+                    "Failed to load pipe.",
+                    debug=debug,
+                    resource_kind="pipe",
+                    resource_id=pipe_id_str,
+                )
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def get_labels(
+            ctx: Context,
+            pipe_id: PipefyId,
+            debug: bool = False,
+        ) -> dict:
+            """List labels defined on a pipe (id and name).
+
+            Uses the same underlying data as ``get_pipe`` (``labels { id name }``) but returns
+            only the label list—lighter for agents that only need valid label IDs for cards or filters.
+
+            Args:
+                pipe_id: Pipe whose labels to load.
+                debug: When True, append GraphQL codes and correlation_id on errors.
+
+            Returns:
+                On success: ``success``, ``message``, and ``labels`` (list of ``{id, name}``).
+                On failure: ``success: False`` and ``error``.
+            """
+            client = get_pipefy_client(ctx)
+            await ctx.debug(f"get_labels: pipe_id={pipe_id}")
+            pipe_id_str, err = validate_tool_id(pipe_id, "pipe_id")
+            if err is not None:
+                return err
+
+            try:
+                raw = await client.get_pipe(pipe_id_str)
+            except Exception as exc:  # noqa: BLE001
+                return handle_tool_graphql_error(
+                    exc,
+                    "Get labels failed.",
+                    debug=debug,
+                    resource_kind="pipe",
+                    resource_id=pipe_id_str,
+                )
+
+            pipe_node = raw.get("pipe")
+            if pipe_node is None:
+                return tool_error("Pipe not found or access denied.")
+
+            labels = pipe_node.get("labels")
+            if labels is None:
+                labels = []
+            return {
+                "success": True,
+                "message": "Labels loaded.",
+                "labels": labels,
+            }
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def get_pipe_members(
+            ctx: Context,
+            pipe_id: PipefyId,
+            debug: bool = False,
+        ) -> dict:
+            """List members of a pipe with roles and basic user profile fields.
+
+            Use this to audit who has access, resolve user IDs for assignments, or before
+            changing membership with invite/remove/role tools.
+
+            Args:
+                pipe_id: Pipe identifier (string or positive integer).
+                    Discover via: ``search_pipes`` or ``get_organization``.
+                debug: When True, append GraphQL codes and correlation_id on errors.
+
+            Returns:
+                dict: GraphQL payload whose ``pipe.members`` entries include ``user``
+                (``id``, ``uuid``, ``name``, ``email``) and ``role_name`` per member.
+            """
+            client = get_pipefy_client(ctx)
+            await ctx.debug(f"get_pipe_members: pipe_id={pipe_id}")
+            pipe_id_str, err = validate_tool_id(pipe_id, "pipe_id")
+            if err is not None:
+                return err
+            try:
+                return await client.get_pipe_members(pipe_id_str)
+            except Exception as exc:  # noqa: BLE001
+                return handle_tool_graphql_error(
+                    exc,
+                    "Failed to load pipe members.",
+                    debug=debug,
+                    resource_kind="pipe",
+                    resource_id=pipe_id_str,
+                )
+
+        @mcp.tool(
+            annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True),
+            meta=REMOTE,
+        )
+        async def move_card_to_phase(
+            card_id: PipefyId,
+            destination_phase_id: PipefyId,
+            ctx: Context,
+        ) -> dict:
+            """Move a card to a target phase (Kanban column) within the same pipe.
+
+            Use this when the workflow should advance or regress a card. On failure, if the
+            destination is not among allowed targets for the card's current phase, the tool may
+            return ``success: false`` with ``valid_destinations`` instead of only the raw API error.
+            On required-field failures, it may return ``success: false`` naming the field (and a
+            hint when a field condition may hide that still-required field).
+
+            Args:
+                card_id: The card to move.
+                    Discover via: ``find_cards`` or ``get_cards(pipe_id)``.
+                destination_phase_id: Target phase ID (must be allowed for the current phase).
+                    Discover via: ``get_phase_allowed_move_targets(current_phase_id)`` where
+                    ``current_phase_id`` comes from ``get_card(card_id).current_phase.id``.
+
+            Returns:
+                dict: Pipefy move mutation response on success. On some validation failures,
+                a structured payload with ``success: false`` and ``valid_destinations`` when the
+                destination phase is not allowed from the current phase, or ``success: false``
+                naming a blocking required field when that pattern is detected.
+            """
+            client = get_pipefy_client(ctx)
+            try:
+                return await client.move_card_to_phase(card_id, destination_phase_id)
+            except Exception as exc:  # noqa: BLE001
+                enriched = await try_enrich_move_card_to_phase_failure(
+                    client,
+                    card_id,
+                    destination_phase_id,
+                )
+                if enriched is not None:
+                    return enriched
+                required_enriched = await try_enrich_required_field_move_failure(
+                    client,
+                    card_id,
+                    str(exc),
+                )
+                if required_enriched is not None:
+                    return required_enriched
+                raise exc
+
+        @mcp.tool(
+            annotations=ToolAnnotations(readOnlyHint=False),
+            meta=REMOTE,
+        )
+        async def update_card_field(
+            card_id: PipefyId,
+            field_id: str,
+            new_value: Any,
+            ctx: Context,
+            debug: bool = False,
+        ) -> dict:
+            """Update a single field of a card.
+
+            Use this tool for simple, single-field updates. The entire field value
+            will be replaced with the new value provided.
+
+            **List-valued fields (connections, attachments, checklists):**
+            never assume append. Prefer ``update_card`` with ``field_updates`` and
+            ``operation`` ``"ADD"`` or ``"REMOVE"`` (``updateFieldsValues``) so you only send
+            the item(s) to add or remove. This tool's ``new_value`` replaces the **entire**
+            list. Pipe labels and assignees are card attributes (``update_card``
+            ``label_ids`` / ``assignee_ids``), not fields — ``field_updates`` cannot
+            address them. For connector/connection fields the list must be related card
+            **ids**, not display titles; ``get_card(include_fields=true)`` returns connector
+            ``value`` as display titles only (not ids), so do not rebuild from that
+            ``value`` — read ids via ``get_card_relations`` (or GraphQL ``array_value``).
+            Concurrent full-list rewrites can still drop items. To *write* links through a
+            pipe relation (not a connector field), use ``create_card_relation`` /
+            ``delete_card_relation``.
+
+            **Not for automations:** if/then rules that stamp or copy dynamic values on cards
+            (``%{id}``, ``%{created_at}``, ``%{automation_event_execution_datetime}``, etc.) belong in
+            ``create_automation`` with ``action_id: "update_card_field"`` and numeric ``fieldId`` in
+            ``extra_input.action_params.field_map``. This tool uses the field **slug** in
+            ``field_id`` for direct card updates, not automation ``field_map`` entries.
+
+            Args:
+                card_id: The ID of the card containing the field to update.
+                    Discover via: ``find_cards`` or ``get_cards(pipe_id)``.
+                field_id: The ID (slug) of the field to update.
+                    Discover via: ``get_phase_fields(phase_id)[].id`` (or ``internal_id`` for numeric forms).
+                new_value: The new value for the field (string, number, list, etc.)
+                debug: When True, append GraphQL codes and correlation_id on errors.
+
+            Returns:
+                dict: GraphQL response with success status and updated card information
+                      including the card's id, title, fields, and updated_at timestamp
+            """
+            client = get_pipefy_client(ctx)
+            try:
+                return await client.update_card_field(card_id, field_id, new_value)
+            except Exception as exc:  # noqa: BLE001
+                return handle_tool_graphql_error(
+                    exc,
+                    "Update card field failed.",
+                    debug=debug,
+                    resource_kind="phase_field",
+                )
+
+        @mcp.tool(
+            annotations=ToolAnnotations(readOnlyHint=False),
+            meta=REMOTE,
+        )
+        async def update_card(
+            card_id: PipefyId,
+            ctx: Context,
+            title: str | None = None,
+            assignee_ids: list[PipefyId] | None = None,
+            label_ids: list[PipefyId] | None = None,
+            due_date: str | None = None,
+            field_updates: list[dict] | None = None,
+        ) -> dict:
+            """Update a card's fields and attributes with intelligent mutation selection.
+
+            This tool automatically chooses between two modes based on parameters:
+
+            **Attribute Mode** (uses `updateCard` mutation):
+            For updating card attributes like title, assignees, labels, due_date.
+
+            **Field Mode** (uses `updateFieldsValues` mutation):
+            For updating custom fields via field_updates list.
+
+            The two modes are exclusive: if ``field_updates`` is present, Field Mode
+            runs and ``title``, ``assignee_ids``, ``label_ids``, and ``due_date`` are
+            discarded. Pipe labels and assignees are card attributes, not list-valued
+            fields — pass ``label_ids`` / ``assignee_ids``, not ``field_updates``.
+
+            If field_updates is empty or omitted, only card attributes will be updated.
+
+            Args:
+                card_id: The ID of the card to update (required)
+                title: New title for the card
+                assignee_ids: List of user IDs to assign (replaces existing)
+                label_ids: List of label IDs to associate (replaces existing)
+                due_date: New due date in ISO 8601 format
+                field_updates: List of field update objects:
+                        - field_id (str): The field ID to update
+                        - value (any): The value(s) to set
+                        - operation (str, optional): "ADD", "REMOVE", or "REPLACE" (default)
+
+            Returns:
+                dict: GraphQL response with updated card information including
+                      phase, assignees, labels, fields, and timestamps
+
+            Examples:
+                update_card(card_id=123, title="New Title")
+                update_card(card_id=123, field_updates=[
+                    {"field_id": "status", "value": "In Progress"},
+                    {"field_id": "priority", "value": "High"},
+                ])
+                update_card(card_id=123, field_updates=[
+                    {"field_id": "tags", "value": "urgent", "operation": "ADD"},
+                ])
+            """
+            client = get_pipefy_client(ctx)
+            return await client.update_card(
+                card_id=card_id,
+                title=title,
+                assignee_ids=assignee_ids,
+                label_ids=label_ids,
+                due_date=due_date,
+                field_updates=field_updates,
+            )
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def get_start_form_fields(
+            pipe_id: PipefyId,
+            ctx: Context,
+            required_only: bool = False,
+        ) -> dict:
+            """Get the start form fields of a pipe.
+
+            Use this tool to understand which fields need to be filled when creating
+            a card in a pipe. Returns field definitions including type, options,
+            and whether they are required.
+
+            Args:
+                pipe_id: The ID of the pipe to get start form fields from
+                required_only: If True, returns only required fields. Default: False
+                              Use this to see the minimum fields needed to create a card.
+
+            Returns:
+                dict: Contains 'start_form_fields' array with field properties:
+                      - id: Field identifier (slug) used when creating cards
+                      - label: Display name of the field
+                      - type: Field type (short_text, select, date, etc.)
+                      - required: Whether the field is mandatory
+                      - editable: Whether the field can be edited after card creation
+                      - options: Available options for select/radio/checklist fields
+                      - description: Field description text
+                      - help: Help text for the field
+            """
+            client = get_pipefy_client(ctx)
+            return await client.get_start_form_fields(pipe_id, required_only)
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def get_phase_fields(
+            phase_id: PipefyId,
+            ctx: Context,
+            required_only: bool = False,
+        ) -> dict:
+            """Get the fields available in a specific phase.
+
+            Use this tool to understand which fields need to be filled on a specific phase.
+            Returns field definitions including type, options, description
+            and whether they are required.
+
+            Args:
+                phase_id: The ID of the phase to get fields from.
+                          You can find phase IDs by calling get_pipe first.
+                required_only: If True, returns only required fields. Default: False.
+                               Use this to see the minimum fields needed in the phase.
+
+            Returns:
+                dict: Contains phase info and 'fields' array with field properties:
+                      - id: Field identifier (slug) used when updating cards
+                      - internal_id: Stable numeric-style ID (use for mutations such as field conditions)
+                      - uuid: Field UUID
+                      - label: Display name of the field
+                      - type: Field type (short_text, select, date, etc.)
+                      - required: Whether the field is mandatory
+                      - editable: Whether the field can be edited
+                      - options: Available options for select/radio/checklist fields
+                      - description: Field description text
+                      - help: Help text for the field
+            """
+            client = get_pipefy_client(ctx)
+            return await client.get_phase_fields(phase_id, required_only)
+
+        @mcp.tool(
+            annotations=ToolAnnotations(readOnlyHint=False),
+            meta=REMOTE,
+        )
+        async def fill_card_phase_fields(
+            ctx: Context,
+            card_id: PipefyId,
+            phase_id: PipefyId,
+            fields: dict[str, Any] | None = None,
+            required_fields_only: bool = False,
+            skip_elicitation: bool = False,
+        ) -> dict:
+            """Fill in the phase fields for a card.
+
+            When ``skip_elicitation`` is True, field values from ``fields`` are
+            filtered to editable phase field IDs and sent directly to the API.
+            AI agents should set this to True when they already know the values.
+
+            When ``skip_elicitation`` is False (default) and the client supports
+            elicitation, an interactive form is presented — ``fields`` pre-fills
+            it so the human can review and adjust.
+
+            A form is only possible when the connection can carry a
+            server-to-client request. It cannot on protocol revision 2026-07-28,
+            on a stateless HTTP transport, or on a deployment serving
+            ``json_response=True`` (which the hosted server does). There the tool
+            takes the ``skip_elicitation`` path instead: only ``fields`` is sent,
+            so an omitted ``fields`` collects nothing and the result reports that
+            no values were collected rather than that the card was updated.
+
+            Args:
+                card_id: The ID of the card to update.
+                    Discover via: ``find_cards`` or ``get_cards(pipe_id)``.
+                phase_id: The ID of the phase whose fields should be filled.
+                    Discover via: ``get_pipe(pipe_id).phases[].id``.
+                fields: A dictionary of fields that can be pre-filled.
+                        When ``skip_elicitation`` is False, these pre-fill the
+                        interactive form. When True, they are sent directly.
+                        Discover via: ``get_phase_fields(phase_id)[].id`` for valid keys.
+                required_fields_only: If True, only elicit required fields. Default: False.
+                skip_elicitation: When True, bypass interactive elicitation and send
+                    ``fields`` directly to the API. Recommended for AI agent workflows.
+
+            Returns:
+                dict: GraphQL response with success status and updated card information.
+            """
+            client = get_pipefy_client(ctx)
+            try:
+                phase_fields_result = await client.get_phase_fields(
+                    phase_id, required_fields_only
+                )
+            except MalformedFieldDefinitionError as exc:
+                return tool_error(str(exc))
+            expected_fields = _filter_editable_field_definitions(
+                phase_fields_result.get("fields", [])
+            )
+            phase_name = phase_fields_result.get("phase_name", f"Phase {phase_id}")
+
+            await ctx.debug(f"Expected fields for phase {phase_id}: {expected_fields}")
+            await ctx.debug(f"Provided fields: {fields}")
+
+            field_data = fields or {}
+            can_elicit = supports_elicitation(ctx)
+            if not can_elicit and not skip_elicitation:
+                # Logged for the same reason the NoBackChannelError absorb in
+                # _elicit_field_details logs: a caller asked for a form and the
+                # result cannot say it never appeared.
+                await ctx.debug(
+                    "Elicitation unavailable: no interactive form for this "
+                    "connection; proceeding with the supplied fields"
+                )
+
+            elicited: dict[str, Any] | None = None
+            if can_elicit and expected_fields and not skip_elicitation:
+                try:
+                    elicited = await PipeTools._elicit_field_details(
+                        message=f"Filling fields for phase '{phase_name}' (ID: {phase_id})",
+                        prefilled_fields=fields,
+                        expected_fields=expected_fields,
+                        ctx=ctx,
+                    )
+                except MalformedFieldDefinitionError as exc:
+                    return tool_error(str(exc))
+                except UserCancelledError:
+                    return tool_error("Phase field update cancelled by user.")
+
+            if elicited is not None:
+                field_data = elicited
+            elif expected_fields:
+                field_data = _filter_fields_by_definitions(field_data, expected_fields)
+
+            if not field_data:
+                if expected_fields:
+                    # The phase does have editable fields, so "No fields to
+                    # update." would be false: values were needed and none were
+                    # collected. Reachable when no form could be shown and the
+                    # caller passed no fields, or when every key it passed was
+                    # dropped by the editable-field filter. An agent reading only
+                    # the message must not conclude the card is complete.
+                    message = (
+                        "No field values were collected, so nothing was updated. "
+                        f"Phase '{phase_name}' has {len(expected_fields)} editable "
+                        "field(s); pass 'fields' keyed by the IDs from "
+                        "get_phase_fields(phase_id)."
+                    )
+                else:
+                    message = "No fields to update."
+                return {
+                    "success": True,
+                    "message": message,
+                    "phase_id": phase_id,
+                    "phase_name": phase_name,
+                }
+
+            field_updates = [
+                {"field_id": field_id, "value": value}
+                for field_id, value in field_data.items()
+            ]
+
+            return await client.update_card(
+                card_id=card_id,
+                field_updates=field_updates,
+            )
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+            ),
+            meta=REMOTE,
+        )
+        async def search_pipes(
+            ctx: Context,
+            pipe_name: str | None = None,
+            max_pipes_per_org: int = 500,
+        ) -> dict:
+            """Search for all accessible pipes across all organizations.
+
+            Use this tool to find a pipe's ID when you only know its name.
+            Returns pipes from all organizations, optionally filtered by name.
+
+            When filtering by name, uses fuzzy matching with a 70% similarity threshold.
+            Only pipes with a match score of 70 or higher are included in the results.
+            Results are sorted by match score (best matches first).
+
+            Without a name filter, each organization returns at most ``max_pipes_per_org``
+            pipes (capped 1--500) to avoid huge responses. With a name filter, the API
+            receives a server-side ``name_search`` hint; results are still capped per org
+            after scoring. Check ``search_limits`` and per-org ``pipes_truncated`` when
+            present. When unfiltered, ``pipes_truncated`` is True if the list was sliced,
+            if ``pipesCount`` exceeds the number of pipes returned, or if ``pipesCount``
+            is missing and the org returned ``max_pipes_per_org`` pipes (conservative:
+            the full org list may be larger).
+
+            Results are also membership shaped: each organization returns only the
+            pipes the calling identity is a member of, so the list can fall below
+            the org-wide ``pipesCount`` even when nothing was truncated. Membership
+            and truncation are separate causes. See
+            ``docs/mcp/tools/organization.md``.
+
+            Args:
+                pipe_name: Optional pipe name to search for (case-insensitive partial match).
+                           If not provided, returns up to ``max_pipes_per_org`` pipes per org.
+                max_pipes_per_org: Maximum pipes per organization (1--500, default 500).
+
+            Returns:
+                dict: Contains 'organizations' array, each with:
+                      - id: Organization ID
+                      - name: Organization name
+                      - pipes: Array of pipes in the organization, each with:
+                          - id: Pipe ID (use this for other pipe operations)
+                          - name: Pipe name
+                          - description: Pipe description
+                          - match_score: Fuzzy match score (0-100) when pipe_name is provided.
+                      And ``search_limits`` with applied caps.
+            """
+            client = get_pipefy_client(ctx)
+            mpc = max(1, min(500, int(max_pipes_per_org)))
+            return await client.search_pipes(pipe_name, max_pipes_per_org=mpc)
+
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=True,
+            ),
+            structured_output=False,
+            meta=REMOTE,
+        )
+        async def delete_card(
+            ctx: Context,
+            card_id: PipefyId,
+            confirm: bool = False,
+            confirmation_token: str | None = None,
+            debug: bool = False,
+        ) -> DeleteCardPayload:
+            """Delete a card from Pipefy.
+
+            Two-step operation: preview with ``confirm=False`` (default), then echo
+            ``confirmation_token`` from the preview on step 2. Elicitation is **not**
+            used to authorize deletion (automated clients may auto-accept prompts).
+
+            Args:
+                card_id: The ID of the card to delete.
+                confirm: Set to True with the preview token to execute the deletion (step 2).
+                confirmation_token: Token from the preview response.
+                debug: When true, appends GraphQL error codes and correlation_id to the error message.
+
+            Returns:
+                Success/error status of the deletion.
+            """
+            client = get_pipefy_client(ctx)
+            card_id_str, err = validate_tool_id(card_id, "card_id")
+            if err is not None:
+                return build_delete_card_error_payload(message=tool_error_message(err))
+
+            try:
+                card_response = await client.get_card(card_id_str)
+                card_data = card_response["card"]
+                card_title = card_data["title"]
+                pipe_name = card_data.get("pipe", {}).get("name", "Unknown Pipe")
+            except Exception as exc:  # noqa: BLE001
+                codes = extract_graphql_error_codes(exc)
+                correlation_id = extract_graphql_correlation_id(exc)
+                base = map_delete_card_error_to_message(
+                    card_id=card_id_str, card_title="Unknown", codes=codes
+                )
+                return build_delete_card_error_payload(
+                    message=with_debug_suffix(
+                        base,
+                        debug=debug,
+                        codes=codes,
+                        correlation_id=correlation_id,
+                    )
+                )
+
+            guard = await check_destructive_confirmation(
+                ctx,
+                confirm=confirm,
+                resource_descriptor=(
+                    f"card '{card_title}' (ID: {card_id_str}) from pipe '{pipe_name}'"
+                ),
+                resource_identity={"card_id": card_id_str},
+                tool_name="delete_card",
+                confirmation_token=confirmation_token,
+            )
+            if guard is not None:
+                return guard
+
+            try:
+                delete_response = await client.delete_card(card_id_str)
+
+                delete_data = delete_response.get("deleteCard", {})
+
+                if delete_data.get("success"):
+                    return build_delete_card_success_payload(
+                        card_id=card_id_str,
+                        card_title=card_title,
+                        pipe_name=pipe_name,
+                    )
+                else:
+                    return build_delete_card_error_payload(
+                        message=(
+                            f"Failed to delete card '{card_title}' (ID: {card_id_str}). "
+                            "Please try again or contact support."
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001
+                codes = extract_graphql_error_codes(exc)
+                correlation_id = extract_graphql_correlation_id(exc)
+                base = map_delete_card_error_to_message(
+                    card_id=card_id_str, card_title=card_title, codes=codes
+                )
+                return build_delete_card_error_payload(
+                    message=with_debug_suffix(
+                        base,
+                        debug=debug,
+                        codes=codes,
+                        correlation_id=correlation_id,
+                    )
+                )
+
+    @staticmethod
+    async def _elicit_field_details(
+        message: str,
+        prefilled_fields: dict[str, Any] | None,
+        expected_fields: list,
+        ctx: Context,
+    ) -> dict | None:
+        """Handle interactive field elicitation.
+
+        Returns the accepted field values, or ``None`` when the connection
+        cannot carry a server-initiated request. A caller that gets ``None``
+        proceeds with the values it was already given, exactly as it does for a
+        client that advertises no elicitation support.
+
+        ``supports_elicitation`` already gates on the back channel, so ``None``
+        is the residual case: the channel can also close between that check and
+        the request (the inbound request finishing closes its dispatch context),
+        and a session shape that does not expose ``can_send_request`` passes the
+        gate unmeasured. Letting ``NoBackChannelError`` escape instead would
+        leave the tool as a JSON-RPC protocol error rather than a tool result.
+
+        Raises:
+            MalformedFieldDefinitionError: ``expected_fields`` cannot be turned
+                into a form model.
+            UserCancelledError: The user declined or cancelled the form.
+        """
+        DynamicFormModel = create_form_model(expected_fields, prefilled_fields)
+        await ctx.debug(
+            f"Created DynamicFormModel: {DynamicFormModel.model_json_schema()}"
+        )
+
+        try:
+            result = await ctx.elicit(
+                message=message,
+                schema=DynamicFormModel,
+            )
+        except NoBackChannelError:
+            await ctx.debug(
+                "Elicitation skipped: connection has no server-to-client back channel"
+            )
+            return None
+        await ctx.debug(f"Elicited result: {result}")
+
+        if result.action != "accept":
+            raise UserCancelledError()
+
+        return result.data.model_dump()

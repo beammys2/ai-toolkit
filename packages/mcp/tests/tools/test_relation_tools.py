@@ -1,0 +1,410 @@
+"""Tests for relation MCP tools (mocked PipefyClient)."""
+
+from datetime import timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from _mcp_compat import (
+    create_connected_server_and_client_session as create_client_session,
+)
+from pipefy_sdk import PipefyClient, PipefyGraphQLError
+
+from pipefy_mcp.core.tool_error_envelope import tool_error_message
+from pipefy_mcp.tools.relation_tools import RelationTools
+from tools.conftest import assert_invalid_arguments_envelope, build_tool_test_server
+from tools.destructive_confirm_test_support import confirm_after_preview
+
+
+@pytest.fixture
+def mock_relation_client():
+    client = MagicMock(PipefyClient)
+    client.get_pipe_relations = AsyncMock()
+    client.get_table_relations = AsyncMock()
+    client.create_pipe_relation = AsyncMock()
+    client.update_pipe_relation = AsyncMock()
+    client.delete_pipe_relation = AsyncMock()
+    client.create_card_relation = AsyncMock()
+    return client
+
+
+@pytest.fixture
+def relation_mcp_server(mock_relation_client):
+    return build_tool_test_server(
+        "Relation Tools Test", RelationTools.register, mock_relation_client
+    )
+
+
+@pytest.fixture
+def relation_session(relation_mcp_server, request):
+    elicitation = getattr(request, "param", None)
+    return create_client_session(
+        relation_mcp_server,
+        read_timeout_seconds=timedelta(seconds=10),
+        raise_exceptions=True,
+        elicitation_callback=elicitation,
+    )
+
+
+@pytest.mark.anyio
+async def test_get_pipe_relations_success(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.get_pipe_relations.return_value = {
+        "pipe": {
+            "id": "1",
+            "parentsRelations": [],
+            "childrenRelations": [{"id": "x", "name": "Child"}],
+        }
+    }
+
+    async with relation_session as session:
+        result = await session.call_tool("get_pipe_relations", {"pipe_id": 1})
+
+    assert result.is_error is False
+    mock_relation_client.get_pipe_relations.assert_awaited_once_with("1")
+    payload = extract_payload(result)
+    assert payload["success"] is True
+    assert payload["data"]["pipe"]["childrenRelations"][0]["name"] == "Child"
+
+
+@pytest.mark.anyio
+async def test_get_pipe_relations_graphql_error(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.get_pipe_relations.side_effect = PipefyGraphQLError(
+        [{"message": "not allowed"}]
+    )
+
+    async with relation_session as session:
+        result = await session.call_tool("get_pipe_relations", {"pipe_id": 9})
+
+    assert result.is_error is False
+    payload = extract_payload(result)
+    assert payload["success"] is False
+    assert "not allowed" in tool_error_message(payload)
+
+
+@pytest.mark.anyio
+async def test_get_pipe_relations_invalid_pipe_id(
+    relation_session, mock_relation_client
+):
+    async with relation_session as session:
+        result = await session.call_tool("get_pipe_relations", {"pipe_id": ""})
+
+    assert_invalid_arguments_envelope(result)
+    mock_relation_client.get_pipe_relations.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_get_pipe_relations_rejects_pipe_id_zero(
+    relation_session, mock_relation_client, extract_payload
+):
+    async with relation_session as session:
+        result = await session.call_tool("get_pipe_relations", {"pipe_id": 0})
+
+    assert result.is_error is False
+    mock_relation_client.get_pipe_relations.assert_not_called()
+    p = extract_payload(result)
+    assert p["success"] is False
+    assert "pipe_id" in tool_error_message(p).lower()
+
+
+@pytest.mark.anyio
+async def test_get_table_relations_success(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.get_table_relations.return_value = {
+        "table_relations": [{"id": "r1", "name": "T"}],
+    }
+
+    async with relation_session as session:
+        result = await session.call_tool(
+            "get_table_relations", {"relation_ids": ["r1"]}
+        )
+
+    assert result.is_error is False
+    mock_relation_client.get_table_relations.assert_awaited_once_with(["r1"])
+    payload = extract_payload(result)
+    assert payload["success"] is True
+    assert payload["data"]["table_relations"][0]["id"] == "r1"
+
+
+@pytest.mark.anyio
+async def test_get_table_relations_graphql_error(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.get_table_relations.side_effect = PipefyGraphQLError(
+        [{"message": "boom"}]
+    )
+
+    async with relation_session as session:
+        result = await session.call_tool("get_table_relations", {"relation_ids": [1]})
+
+    assert result.is_error is False
+    assert extract_payload(result)["success"] is False
+
+
+@pytest.mark.anyio
+async def test_get_table_relations_invalid_relation_ids(
+    relation_session, mock_relation_client, extract_payload
+):
+    async with relation_session as session:
+        result = await session.call_tool("get_table_relations", {"relation_ids": []})
+
+    assert result.is_error is False
+    mock_relation_client.get_table_relations.assert_not_called()
+    assert extract_payload(result)["success"] is False
+
+
+@pytest.mark.anyio
+async def test_create_pipe_relation_success(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.create_pipe_relation.return_value = {
+        "createPipeRelation": {"pipeRelation": {"id": "r1", "name": "L"}},
+    }
+
+    async with relation_session as session:
+        result = await session.call_tool(
+            "create_pipe_relation",
+            {"parent_id": 1, "child_id": 2, "name": "L"},
+        )
+
+    assert result.is_error is False
+    mock_relation_client.create_pipe_relation.assert_awaited_once_with(
+        "1", "2", "L", extra_input=None
+    )
+    payload = extract_payload(result)
+    assert payload["success"] is True
+    assert payload["result"]["createPipeRelation"]["pipeRelation"]["id"] == "r1"
+
+
+@pytest.mark.anyio
+async def test_create_pipe_relation_graphql_error(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.create_pipe_relation.side_effect = PipefyGraphQLError(
+        [{"message": "reject"}]
+    )
+
+    async with relation_session as session:
+        result = await session.call_tool(
+            "create_pipe_relation",
+            {"parent_id": 1, "child_id": 2, "name": "x"},
+        )
+
+    assert extract_payload(result)["success"] is False
+    assert "reject" in tool_error_message(extract_payload(result))
+
+
+@pytest.mark.anyio
+async def test_create_pipe_relation_invalid_name(
+    relation_session, mock_relation_client, extract_payload
+):
+    async with relation_session as session:
+        result = await session.call_tool(
+            "create_pipe_relation",
+            {"parent_id": 1, "child_id": 2, "name": "   "},
+        )
+
+    mock_relation_client.create_pipe_relation.assert_not_called()
+    assert extract_payload(result)["success"] is False
+
+
+@pytest.mark.anyio
+async def test_update_pipe_relation_success(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.update_pipe_relation.return_value = {
+        "updatePipeRelation": {"pipeRelation": {"id": "9", "name": "N"}},
+    }
+
+    async with relation_session as session:
+        result = await session.call_tool(
+            "update_pipe_relation",
+            {"relation_id": 9, "name": "N"},
+        )
+
+    assert result.is_error is False
+    mock_relation_client.update_pipe_relation.assert_awaited_once_with(
+        "9", "N", extra_input=None
+    )
+    assert extract_payload(result)["success"] is True
+
+
+@pytest.mark.anyio
+async def test_update_pipe_relation_graphql_error(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.update_pipe_relation.side_effect = PipefyGraphQLError(
+        [{"message": "fail"}]
+    )
+
+    async with relation_session as session:
+        result = await session.call_tool(
+            "update_pipe_relation",
+            {"relation_id": 1, "name": "x"},
+        )
+
+    assert extract_payload(result)["success"] is False
+
+
+@pytest.mark.anyio
+async def test_delete_pipe_relation_success(relation_session, mock_relation_client):
+    mock_relation_client.delete_pipe_relation.return_value = {
+        "deletePipeRelation": {"success": True},
+    }
+
+    async with relation_session as session:
+        payload = await confirm_after_preview(
+            session,
+            "delete_pipe_relation",
+            {"relation_id": 100, "confirm": True},
+        )
+
+    mock_relation_client.delete_pipe_relation.assert_awaited_once_with("100")
+    assert payload["success"] is True
+
+
+@pytest.mark.anyio
+async def test_delete_pipe_relation_graphql_error(
+    relation_session, mock_relation_client
+):
+    mock_relation_client.delete_pipe_relation.side_effect = PipefyGraphQLError(
+        [{"message": "denied"}]
+    )
+
+    async with relation_session as session:
+        payload = await confirm_after_preview(
+            session,
+            "delete_pipe_relation",
+            {"relation_id": 1, "confirm": True},
+        )
+
+    assert payload["success"] is False
+    assert "denied" in tool_error_message(payload)
+
+
+@pytest.mark.anyio
+async def test_delete_pipe_relation_has_destructive_hint(relation_session):
+    async with relation_session as session:
+        listed = await session.list_tools()
+    delete_tool = next(t for t in listed.tools if t.name == "delete_pipe_relation")
+    assert delete_tool.annotations is not None
+    assert delete_tool.annotations.destructive_hint is True
+    assert delete_tool.annotations.read_only_hint is False
+
+
+@pytest.mark.anyio
+async def test_create_card_relation_success(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.create_card_relation.return_value = {
+        "createCardRelation": {"cardRelation": {"id": "x"}},
+    }
+
+    async with relation_session as session:
+        result = await session.call_tool(
+            "create_card_relation",
+            {"parent_id": 10, "child_id": 20, "source_id": 30},
+        )
+
+    assert result.is_error is False
+    mock_relation_client.create_card_relation.assert_awaited_once_with(
+        "10", "20", "30", extra_input=None
+    )
+    payload = extract_payload(result)
+    assert payload["success"] is True
+    assert payload["result"]["createCardRelation"]["cardRelation"]["id"] == "x"
+
+
+@pytest.mark.anyio
+async def test_create_card_relation_graphql_error(
+    relation_session, mock_relation_client, extract_payload
+):
+    mock_relation_client.create_card_relation.side_effect = PipefyGraphQLError(
+        [{"message": "invalid link"}]
+    )
+
+    async with relation_session as session:
+        result = await session.call_tool(
+            "create_card_relation",
+            {"parent_id": 1, "child_id": 2, "source_id": 3},
+        )
+
+    p = extract_payload(result)
+    assert p["success"] is False
+    assert "invalid link" in tool_error_message(p)
+
+
+@pytest.mark.anyio
+async def test_create_card_relation_invalid_source_id(
+    relation_session, mock_relation_client
+):
+    async with relation_session as session:
+        result = await session.call_tool(
+            "create_card_relation",
+            {"parent_id": 1, "child_id": 2, "source_id": ""},
+        )
+
+    mock_relation_client.create_card_relation.assert_not_called()
+    assert_invalid_arguments_envelope(result)
+
+
+@pytest.mark.anyio
+async def test_create_pipe_relation_rejects_non_dict_extra_input(
+    relation_session, mock_relation_client, extract_payload
+):
+    async with relation_session as session:
+        result = await session.call_tool(
+            "create_pipe_relation",
+            {
+                "parent_id": 1,
+                "child_id": 2,
+                "name": "L",
+                "extra_input": "not-a-dict",
+            },
+        )
+
+    mock_relation_client.create_pipe_relation.assert_not_called()
+    p = extract_payload(result)
+    assert p["success"] is False
+    assert "extra_input" in tool_error_message(p)
+    assert "dict" in tool_error_message(p)
+
+
+@pytest.mark.anyio
+async def test_update_pipe_relation_rejects_non_dict_extra_input(
+    relation_session, mock_relation_client, extract_payload
+):
+    async with relation_session as session:
+        result = await session.call_tool(
+            "update_pipe_relation",
+            {"relation_id": 1, "name": "N", "extra_input": []},
+        )
+
+    mock_relation_client.update_pipe_relation.assert_not_called()
+    p = extract_payload(result)
+    assert p["success"] is False
+    assert "extra_input" in tool_error_message(p)
+
+
+@pytest.mark.anyio
+async def test_create_card_relation_rejects_non_dict_extra_input(
+    relation_session, mock_relation_client, extract_payload
+):
+    async with relation_session as session:
+        result = await session.call_tool(
+            "create_card_relation",
+            {
+                "parent_id": 1,
+                "child_id": 2,
+                "source_id": 3,
+                "extra_input": 123,
+            },
+        )
+
+    mock_relation_client.create_card_relation.assert_not_called()
+    p = extract_payload(result)
+    assert p["success"] is False
+    assert "extra_input" in tool_error_message(p)

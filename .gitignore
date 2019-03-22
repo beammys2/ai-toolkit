@@ -1,0 +1,62 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Ruff stuff:
+.ruff_cache/
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.mise.toml
+
+# Ralph Wiggum (local autonomous runs; state must not land in git)
+.ralph/
+RALPH_TASK.md
+
+# IDEs and editors
+.cursor/
+.claude/
+# Cursor MCP workspace config (machine-specific paths or local server entries).
+# Carve-out: repo-root .mcp.json is the hosted MCP config shared by the Claude
+# Code plugin (auto-discovered) and the Cursor plugin (`mcpServers`) and is
+# intentionally tracked.
+.mcp.json
+!/.mcp.json
+
+# Tracked release tooling only (ignore ad-hoc local scripts and smoke artifacts)
+scripts/*
+!scripts/bump_version.py
+!scripts/release.py
+!scripts/smoke_entry_points.py
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Local-only planning/scratch (may contain internal context)
+tmp/

@@ -1,0 +1,683 @@
+#!/bin/sh
+# install.sh — one-command installer for Pipefy CLI + MCP server.
+#
+# Resolves the latest GitHub Release tag (or a tag passed via --version),
+# discovers its wheel assets, installs the CLI and MCP server via
+# `uv tool install`, optionally installs skills via `npx skills add`, and
+# writes the MCP server registration into the chosen client's config.
+#
+# "Latest" deliberately excludes alpha tags: those are staging cuts off `dev`,
+# published for the hosted MCP server to pin, and must never be what this
+# installer hands out. Pass --version to install one on purpose.
+
+set -eu
+
+REPO="pipefy/ai-toolkit"
+TOOLS="pipefy_cli pipefy_mcp_server"  # wheels installed as standalone uv tools
+
+YES=0
+NO_SKILLS=0
+CLIENT=""
+TAG=""
+PREFIX=""
+ALLOW_ROOT=0
+DRY_RUN=0
+
+OS=""
+WHEEL_URLS=""
+UV_INSTALLED_THIS_RUN=0
+PYTHON_OVERRIDE=""
+
+RECEIPT_SCHEMA=1
+RECEIPT=""
+RECEIPT_TAB=$(printf '\t')
+RECEIPT_CR=$(printf '\r')
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+err() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+run() {
+    printf '+ %s\n' "$*" >&2
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return 0
+    fi
+    "$@"
+}
+
+# Like `run`, but captures stdout+stderr; prints them only if the command
+# fails. Use for `uv tool install` and similar commands that produce a long
+# package-list summary on success the user doesn't need to see (uv's own
+# --quiet flag doesn't suppress that summary on every uv version).
+run_quiet() {
+    printf '+ %s\n' "$*" >&2
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return 0
+    fi
+    _rq_log=$(mktemp "${TMPDIR:-/tmp}/pipefy-install.XXXXXX") \
+        || err "mktemp failed (TMPDIR=${TMPDIR:-/tmp})"
+    # Clean up the tempfile even on signal (Ctrl-C between mktemp and rm).
+    trap 'rm -f "$_rq_log"' EXIT INT TERM
+    # Captured on the failing command itself: `$?` after an `if` whose
+    # condition failed is the `if`'s own status, which is 0, so reading it
+    # there turns every failure into a success.
+    _rq_rc=0
+    "$@" >"$_rq_log" 2>&1 || _rq_rc=$?
+    if [ "$_rq_rc" -eq 0 ]; then
+        rm -f "$_rq_log"
+        trap - EXIT INT TERM
+        return 0
+    fi
+    cat "$_rq_log" >&2 || true
+    rm -f "$_rq_log"
+    trap - EXIT INT TERM
+    return "$_rq_rc"
+}
+
+print_help() {
+    cat <<EOF
+Usage: install.sh [OPTIONS]
+
+Install the Pipefy CLI and MCP server via uv, optionally add skills,
+and register the MCP server with an MCP client.
+
+Options:
+  --yes, -y           Skip all confirmation prompts.
+  --no-skills         Skip the skills installation step.
+  --client <id>       Register MCP server in this client's config.
+                      One of: claude-code, claude-desktop, cursor, codex, none.
+                      Defaults to 'none' (prints snippet to paste).
+  --version <tag>     Install a specific GitHub Release tag (e.g. v0.2.0-beta.2).
+                      Defaults to the most recent release, skipping staging
+                      alphas; pass the tag to install one of those on purpose.
+  --prefix <dir>      Pass through as UV_TOOL_DIR for uv tool install.
+  --allow-root        Allow running as root (refuses by default).
+  --dry-run           Print commands without executing them.
+  -h, --help          Show this help.
+
+Examples:
+  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh \\
+    | sh -s -- --client cursor
+
+  ./install.sh --yes --client claude-desktop
+  ./install.sh --dry-run --version v0.2.0-beta.2
+EOF
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y) YES=1; shift ;;
+            --no-skills) NO_SKILLS=1; shift ;;
+            --client) [ $# -ge 2 ] || err "--client requires a value"; CLIENT="$2"; shift 2 ;;
+            --client=*) CLIENT="${1#--client=}"; shift ;;
+            --version) [ $# -ge 2 ] || err "--version requires a value"; TAG="$2"; shift 2 ;;
+            --version=*) TAG="${1#--version=}"; shift ;;
+            --prefix) [ $# -ge 2 ] || err "--prefix requires a value"; PREFIX="$2"; shift 2 ;;
+            --prefix=*) PREFIX="${1#--prefix=}"; shift ;;
+            --allow-root) ALLOW_ROOT=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            -h|--help) print_help; exit 0 ;;
+            *) err "Unknown flag: $1 (try --help)" ;;
+        esac
+    done
+    case "$CLIENT" in
+        ""|claude-code|claude-desktop|cursor|codex|none) ;;
+        *) err "Invalid --client: $CLIENT (use claude-code|claude-desktop|cursor|codex|none)" ;;
+    esac
+}
+
+refuse_root() {
+    if [ "$(id -u)" = "0" ] && [ "$ALLOW_ROOT" -eq 0 ]; then
+        err "Refusing to run as root. Re-run as a regular user, or pass --allow-root."
+    fi
+}
+
+detect_platform() {
+    OS="$(uname -s)"
+    case "$OS" in
+        Darwin|Linux) ;;
+        *) err "Unsupported OS: $OS. install.sh supports macOS and Linux." ;;
+    esac
+}
+
+confirm() {
+    msg="$1"
+    if [ "$YES" -eq 1 ]; then
+        return 0
+    fi
+    if [ -t 0 ]; then
+        printf '%s [y/N] ' "$msg"
+        read -r reply || reply=""
+    elif [ -r /dev/tty ]; then
+        printf '%s [y/N] ' "$msg" >&2
+        read -r reply < /dev/tty || reply=""
+    else
+        err "No TTY available for prompt: \"$msg\". Re-run with --yes to proceed non-interactively."
+    fi
+    case "$reply" in
+        [yY]|[yY][eE][sS]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ------------------------------------------------------------------ receipt
+#
+# What this run did, so uninstall.sh can be exact instead of guessing: which
+# tool directory the tools went into, whether uv was already here, whether a
+# client registration was created or found already present, where the skills
+# landed, and which release this was.
+#
+# Plain key=value, parsed with POSIX text tools alone. The JSON merge below
+# needs python3; teardown must not inherit that, so nothing about this format
+# does.
+#
+# One record per run, appended and never rewritten, so a second run with a
+# different --client does not erase the first. Each line is written as its step
+# succeeds, so an install that dies halfway still leaves the steps that did
+# happen; the closing `record=end` is what says the run finished.
+#
+# A value occupies exactly one line: backslash, tab, carriage return and
+# newline are written as \\, \t, \r and \n. `=` needs no escaping because a
+# reader splits on the first one only, and a space needs none because nothing
+# splits on whitespace.
+
+# The receipt is installer state, not user configuration. ~/.config/pipefy is
+# the user's, holds a file they authored, and is removed by teardown once it is
+# empty; state belongs under XDG_STATE_HOME, resolved the way
+# pipefy_infra.config.config_dir() resolves XDG_CONFIG_HOME.
+receipt_path() {
+    printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/pipefy/install-receipt"
+}
+
+receipt_escape() {
+    # The trailing sentinel survives the command substitution, which would
+    # otherwise eat a value that ends in a newline.
+    _re=$(printf '%s.' "$1" \
+        | sed -e 's/\\/\\\\/g' \
+              -e "s/$RECEIPT_TAB/\\\\t/g" \
+              -e "s/$RECEIPT_CR/\\\\r/g" \
+        | awk 'BEGIN { ORS = "" } NR > 1 { printf "%s", "\\n" } { print }')
+    printf '%s' "${_re%.}"
+}
+
+# A receipt that cannot be written is a degraded teardown, never a failed
+# install: the tools are what the user asked for.
+receipt_put() {
+    [ -n "$RECEIPT" ] || return 0
+    if ! printf '%s=%s\n' "$1" "$(receipt_escape "$2")" >>"$RECEIPT"; then
+        warn "could not append to $RECEIPT; this run is only partly recorded and uninstall.sh will fall back to heuristics"
+        RECEIPT=""
+    fi
+}
+
+receipt_begin() {
+    _rb_path=$(receipt_path)
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '+ record this run in %s\n' "$_rb_path" >&2
+        return 0
+    fi
+    if ! mkdir -p "$(dirname "$_rb_path")" 2>/dev/null; then
+        warn "could not create $(dirname "$_rb_path"); this run is not recorded and uninstall.sh will fall back to heuristics"
+        return 0
+    fi
+    RECEIPT="$_rb_path"
+    receipt_put record begin
+    # schema comes first so a reader can reject a record it cannot parse
+    # before it reads a single value out of it.
+    receipt_put schema "$RECEIPT_SCHEMA"
+    receipt_put time "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
+}
+
+receipt_uv() {
+    if [ "$UV_INSTALLED_THIS_RUN" -eq 1 ]; then
+        receipt_put uv_installed_by_us true
+    else
+        receipt_put uv_installed_by_us false
+    fi
+}
+
+# Where `npx skills add` can write: the global directory, and the project one
+# it picks instead when it runs inside a project. This script does not get to
+# tell it which, so both are looked at.
+skills_candidate_dirs() {
+    printf '%s\n' "$HOME/.claude/skills"
+    [ "$PWD" = "$HOME" ] || printf '%s\n' "$PWD/.claude/skills"
+}
+
+# One "<dir><tab><name>" line per skill of ours currently in either directory.
+skills_present() {
+    while IFS= read -r _sp_dir; do
+        [ -d "$_sp_dir" ] || continue
+        for _sp_skill in "$_sp_dir"/pipefy-*; do
+            [ -f "$_sp_skill/SKILL.md" ] || continue
+            printf '%s%s%s\n' "$_sp_dir" "$RECEIPT_TAB" "$(basename "$_sp_skill")"
+        done
+    done <<EOF
+$(skills_candidate_dirs)
+EOF
+}
+
+# The skills this run added, by difference against what was there before it.
+# Not "every pipefy-* directory": a skill the user wrote under that name is
+# none of the installer's business, and teardown reads these names to decide
+# what it is allowed to delete. Recording the directory the same way keeps the
+# receipt honest when the tool lands somewhere this did not predict — then it
+# records nothing rather than something false.
+receipt_skills() {
+    _rs_before="$1"
+    _rs_dirs=""
+    while IFS= read -r _rs_line; do
+        [ -n "$_rs_line" ] || continue
+        if printf '%s\n' "$_rs_before" | grep -Fqx -- "$_rs_line"; then
+            continue
+        fi
+        _rs_dir="${_rs_line%"$RECEIPT_TAB"*}"
+        if ! printf '%s\n' "$_rs_dirs" | grep -Fqx -- "$_rs_dir"; then
+            _rs_dirs="$_rs_dirs$_rs_dir
+"
+            receipt_put skills_dir "$_rs_dir"
+        fi
+        receipt_put skill "${_rs_line##*"$RECEIPT_TAB"}"
+    done <<EOF
+$(skills_present)
+EOF
+}
+
+# 0 from the merge means this run created the entry, 3 means it found one and
+# left it alone. Recording which is the whole point: without it teardown cannot
+# tell a registration it made from one that was already there.
+receipt_client_entry() {
+    case "$2" in
+        0) receipt_put "entry_created.$1" true ;;
+        3) receipt_put "entry_created.$1" false ;;
+    esac
+}
+
+receipt_end() {
+    receipt_put record end
+}
+
+detect_uv() {
+    if command -v uv >/dev/null 2>&1; then
+        return 0
+    fi
+    confirm "uv is not installed. Install from https://astral.sh/uv?" \
+        || err "uv is required; aborting."
+    printf '+ curl -LsSf https://astral.sh/uv/install.sh | sh -s -- -q\n' >&2
+    # Set the banner flag before any side effects, so the dry-run preview also
+    # shows what a real run would print at the end.
+    UV_INSTALLED_THIS_RUN=1
+    if [ "$DRY_RUN" -eq 0 ]; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh -s -- -q
+        if [ -d "$HOME/.local/bin" ]; then
+            PATH="$HOME/.local/bin:$PATH"
+            export PATH
+        fi
+        if ! command -v uv >/dev/null 2>&1; then
+            err "uv install ran but 'uv' is not on PATH. Open a new shell and re-run install.sh."
+        fi
+    fi
+}
+
+pick_system_python() {
+    # On macOS, prefer a system/Homebrew python3 over uv-managed
+    # python-build-standalone (PBS). PBS binaries lack the entitlements that
+    # `Security.framework` requires for keychain writes, so `pipefy auth login`
+    # later fails with `(-25244, 'Unknown Error')` (errSecMissingEntitlement).
+    # On Linux, uv's default Python is fine.
+    [ "$OS" = "Darwin" ] || return 0
+    # Honor UV_PYTHON only when it points at an absolute path (a user-pinned
+    # interpreter). A version spec like `UV_PYTHON=3.13` leaves uv free to
+    # resolve to PBS, which is the failure case this function exists to avoid.
+    uv_python_is_spec=0
+    case "${UV_PYTHON:-}" in
+        /*) return 0 ;;
+        ?*) uv_python_is_spec=1 ;;
+    esac
+
+    # Build a probe-local PATH that includes Homebrew's standard prefixes. A
+    # `curl | sh` run from a non-interactive shell (CI, cron, freshly-spawned
+    # subshell whose rc hasn't loaded Homebrew's shellenv) can inherit a PATH
+    # of just /usr/bin and friends; without this, brew's python3 is invisible
+    # and the loop falls through to PBS. The augmented PATH is scoped to the
+    # probe so the rest of main() (uv, curl, python3, npx, pipefy lookups)
+    # sees the unmodified PATH.
+    # /usr/local/bin first, then /opt/homebrew/bin, so the Apple-Silicon-native
+    # prefix lands at the front; on Intel /opt/homebrew/bin typically doesn't
+    # exist and is skipped.
+    probe_path="$PATH"
+    for brew_dir in /usr/local/bin /opt/homebrew/bin; do
+        [ -d "$brew_dir" ] && probe_path="$brew_dir:$probe_path"
+    done
+
+    keychain_hint="if 'pipefy auth login' later fails with keychain error -25244, set PIPEFY_KEYCHAIN_BACKEND=file or install Homebrew python3."
+
+    for cmd in python3.14 python3.13 python3.12 python3.11 python3; do
+        path=$(PATH="$probe_path"; command -v "$cmd" 2>/dev/null) || continue
+        [ -n "$path" ] || continue
+        # Probe version and resolve sys.executable in the same Python call so
+        # the PBS-path filter runs against the real interpreter, not a symlink:
+        # uv shims under ~/.local/bin/python3.NN point into PBS but their own
+        # paths don't contain `/share/uv/python/`.
+        real_path=$("$path" -c 'import os, sys; sys.version_info >= (3, 11) or sys.exit(1); print(os.path.realpath(sys.executable))' 2>/dev/null) || continue
+        case "$real_path" in
+            */.local/share/uv/python/*|*/share/uv/python/*) continue ;;
+        esac
+        PYTHON_OVERRIDE="$path"
+        say "Using system Python for tool venvs: $path"
+        say "  (avoids macOS keychain entitlement failures with uv-managed Python.)"
+        if [ "$uv_python_is_spec" -eq 1 ]; then
+            warn "UV_PYTHON=$UV_PYTHON (a version spec) overridden by $path to avoid PBS."
+        fi
+        return 0
+    done
+
+    if [ "$uv_python_is_spec" -eq 1 ]; then
+        warn "UV_PYTHON=$UV_PYTHON is a version spec, not an absolute path, and no system python3 >= 3.11 was found on PATH. uv will resolve UV_PYTHON to its managed Python (PBS); $keychain_hint"
+        return 0
+    fi
+    warn "No system python3 >= 3.11 found on PATH. uv will use its managed Python; $keychain_hint"
+}
+
+resolve_release() {
+    if [ -n "$TAG" ]; then
+        say "Using --version: $TAG"
+    else
+        say "Resolving latest release from GitHub..."
+        # The releases list is newest-first, so the first non-alpha tag in it is
+        # the newest release a default install should get. Filtering by tag
+        # shape (rather than the API's `prerelease` flag) keeps this working
+        # while the whole line is still pre-1.0 betas, which must stay
+        # installable.
+        list_url="https://api.github.com/repos/$REPO/releases?per_page=30"
+        list=$(curl -fsSL "$list_url") \
+            || err "Failed to reach GitHub API: $list_url"
+        # -i so the spelling agrees with the release tooling's own classifier
+        # (scripts/bump_version.py prerelease_track), which is case-insensitive.
+        TAG=$(printf '%s' "$list" \
+            | grep '"tag_name"' \
+            | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' \
+            | grep -Eiv '^v?[0-9]+\.[0-9]+\.[0-9]+[-_.]?(a|alpha)\.?[0-9]+$' \
+            | head -n 1)
+        [ -n "$TAG" ] || err "GitHub returned no non-alpha releases for $REPO"
+        say "Resolved tag: $TAG"
+    fi
+    # Fetch the chosen release on its own so the wheel URLs below come from that
+    # tag only, never from a neighbour in the list above.
+    api_url="https://api.github.com/repos/$REPO/releases/tags/$TAG"
+    body=$(curl -fsSL "$api_url") || err "Failed to reach GitHub API: $api_url"
+    WHEEL_URLS=$(printf '%s' "$body" \
+        | grep '"browser_download_url"' \
+        | grep -oE 'https://[^"]+\.whl' \
+        || true)
+    [ -n "$WHEEL_URLS" ] || err "Release $TAG has no wheel assets at $api_url"
+    say "Wheels in $TAG:"
+    printf '%s\n' "$WHEEL_URLS" | sed 's/^/  /'
+}
+
+install_tool() {
+    pkg="$1"
+    main_url=""
+    set --
+    while IFS= read -r url; do
+        [ -z "$url" ] && continue
+        # Skip sibling tools (each tool is installed in its own venv; bundling them
+        # as --with would inject the sibling's binary into this tool's environment).
+        skip=0
+        for tool in $TOOLS; do
+            [ "$tool" = "$pkg" ] && continue
+            case "$url" in
+                */"$tool"-*) skip=1; break ;;
+            esac
+        done
+        if [ "$skip" -eq 1 ]; then
+            continue
+        fi
+        case "$url" in
+            */"$pkg"-*) main_url="$url" ;;
+            *) set -- "$@" --with "$url" ;;
+        esac
+    done <<EOF
+$WHEEL_URLS
+EOF
+    if [ -z "$main_url" ]; then
+        err "Release $TAG does not ship a $pkg wheel"
+    fi
+    set -- "$@" "$main_url"
+    say "Installing $pkg (this may take a few seconds)..."
+    if [ -n "$PYTHON_OVERRIDE" ]; then
+        run_quiet uv tool install --force --python "$PYTHON_OVERRIDE" "$@"
+    else
+        run_quiet uv tool install --force "$@"
+    fi
+    # The wheel is named for the module, the uv tool for the distribution.
+    receipt_put uv_tool "$(printf '%s' "$pkg" | tr '_' '-')"
+}
+
+install_skills() {
+    if [ "$NO_SKILLS" -eq 1 ]; then
+        return 0
+    fi
+    if ! command -v npx >/dev/null 2>&1; then
+        warn "npx not found; skipping skills install. Install Node.js >= 18 or pass --no-skills to silence this warning."
+        return 0
+    fi
+    if confirm "Install Pipefy skills via 'npx skills add'?"; then
+        _is_before=$(skills_present)
+        run npx skills add "$REPO" -y
+        receipt_skills "$_is_before"
+    fi
+}
+
+claude_desktop_config_path() {
+    printf '%s\n' "$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+}
+
+require_python3() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        err "python3 is required for JSON config merge but was not found. Install python3 or use --client none."
+    fi
+}
+
+# Returns 0 when this run created the entry and 3 when it found one already
+# there. Anything else is a failure the python below has already explained.
+json_merge_pipefy() {
+    path="$1"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '+ ensure mcpServers.pipefy in %s (preserve existing entry if present)\n' "$path" >&2
+        return 0
+    fi
+    require_python3
+    mkdir -p "$(dirname "$path")"
+    _jm_rc=0
+    python3 - "$path" <<'PY' || _jm_rc=$?
+import json, os, pathlib, sys, tempfile
+
+p = pathlib.Path(sys.argv[1])
+data = {}
+if p.exists():
+    text = p.read_text(encoding="utf-8").strip()
+    if text:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            sys.stderr.write(
+                f"error: {p} is not valid JSON ({exc}); "
+                f"use --client none and paste the snippet manually\n"
+            )
+            sys.exit(1)
+if not isinstance(data, dict):
+    sys.stderr.write(
+        f"error: {p} root is not a JSON object; "
+        f"use --client none and paste the snippet manually\n"
+    )
+    sys.exit(1)
+servers = data.get("mcpServers")
+if not isinstance(servers, dict):
+    servers = {}
+    data["mcpServers"] = servers
+if "pipefy" in servers:
+    print(f"{p}: mcpServers.pipefy already present; leaving as-is")
+    # 3, not 0: the caller records whether this run created the entry, and a
+    # removal that cannot tell the two apart deletes the user's own work.
+    sys.exit(3)
+servers["pipefy"] = {"command": "pipefy-mcp-server"}
+fd, tmp_path = tempfile.mkstemp(prefix=p.name + ".", dir=str(p.parent))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        # ensure_ascii=False: another server's UTF-8 value is not this run's to
+        # rewrite into escapes.
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp_path, p)
+except BaseException:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
+print(f"Updated {p}")
+PY
+    case "$_jm_rc" in
+        0|3) return "$_jm_rc" ;;
+        *) exit "$_jm_rc" ;;
+    esac
+}
+
+# Same contract as json_merge_pipefy: 0 created, 3 found already present.
+codex_append_pipefy() {
+    path="$1"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '+ append [mcp_servers.pipefy] section to %s (if not already present)\n' "$path" >&2
+        return 0
+    fi
+    mkdir -p "$(dirname "$path")"
+    if [ -f "$path" ] && grep -q '^\[mcp_servers\.pipefy\]' "$path"; then
+        say "$path already has [mcp_servers.pipefy]; leaving as-is."
+        return 3
+    fi
+    if [ -f "$path" ] && [ -s "$path" ]; then
+        printf '\n' >> "$path"
+    fi
+    cat >> "$path" <<'TOML'
+[mcp_servers.pipefy]
+command = "pipefy-mcp-server"
+TOML
+    say "Updated $path"
+}
+
+print_manual_snippet() {
+    cat <<'EOF'
+Paste this into your MCP client's config (add to the existing `mcpServers` object):
+
+{
+  "mcpServers": {
+    "pipefy": {
+      "command": "pipefy-mcp-server"
+    }
+  }
+}
+EOF
+}
+
+write_client_config() {
+    _wc_rc=0
+    case "$CLIENT" in
+        cursor)
+            json_merge_pipefy "$HOME/.cursor/mcp.json" || _wc_rc=$?
+            receipt_client_entry cursor "$_wc_rc"
+            ;;
+        claude-desktop)
+            json_merge_pipefy "$(claude_desktop_config_path)" || _wc_rc=$?
+            receipt_client_entry claude-desktop "$_wc_rc"
+            ;;
+        codex)
+            codex_append_pipefy "$HOME/.codex/config.toml" || _wc_rc=$?
+            receipt_client_entry codex "$_wc_rc"
+            ;;
+        claude-code)
+            cat <<EOF
+To install in Claude Code, run these slash commands in order:
+  /plugin marketplace add $REPO
+  /plugin install pipefy@pipefy
+  /pipefy:install
+  /pipefy:pipefy-login
+EOF
+            ;;
+        ""|none)
+            print_manual_snippet
+            ;;
+        *)
+            err "Unknown --client value: $CLIENT"
+            ;;
+    esac
+}
+
+print_next_steps() {
+    say ""
+    say "Install complete."
+    if [ "$DRY_RUN" -eq 0 ] && command -v pipefy >/dev/null 2>&1; then
+        pipefy --version || true
+    fi
+    if [ -n "$RECEIPT" ]; then
+        say ""
+        say "Recorded this run in $RECEIPT, which uninstall.sh reads so it removes"
+        say "what this install created and leaves what it found."
+    fi
+    if [ "$UV_INSTALLED_THIS_RUN" -eq 1 ]; then
+        say ""
+        say "==> uv was installed during this run."
+        say "    'pipefy' and 'pipefy-mcp-server' live in \$HOME/.local/bin, which may"
+        say "    not be on this shell's PATH yet. To add it for the CURRENT shell,"
+        say "    either restart your shell or run:"
+        say ""
+        say "        source \$HOME/.local/bin/env       (sh, bash, zsh)"
+        say "        source \$HOME/.local/bin/env.fish  (fish)"
+        say ""
+        say "    For future shells, uv typically updates your shell rc (~/.bashrc,"
+        say "    ~/.zshrc, ~/.config/fish/conf.d/uv.fish). If a new terminal still"
+        say "    can't find 'pipefy', add \$HOME/.local/bin to PATH manually."
+    fi
+    say ""
+    say "Next: authenticate with Pipefy."
+    say "  Default (browser):   pipefy auth login"
+    say "  Headless (device):   pipefy auth login --device"
+    if [ "$CLIENT" = "claude-code" ]; then
+        say "  Via Claude Code:     /pipefy:pipefy-login"
+    fi
+}
+
+main() {
+    parse_args "$@"
+    refuse_root
+    detect_platform
+    case "$CLIENT:$OS" in
+        claude-desktop:Linux)
+            err "Claude Desktop has no Linux build. Use --client claude-code, --client cursor, or --client none (prints the snippet to paste into your own config)." ;;
+    esac
+    if [ -n "$PREFIX" ]; then
+        UV_TOOL_DIR="$PREFIX"
+        export UV_TOOL_DIR
+    fi
+    receipt_begin
+    # Recorded whether it came from --prefix or from the caller's environment:
+    # either way the tool environments are unfindable at teardown time unless
+    # the same variable happens to be exported again.
+    if [ -n "${UV_TOOL_DIR:-}" ]; then
+        receipt_put uv_tool_dir "$UV_TOOL_DIR"
+    fi
+    detect_uv
+    receipt_uv
+    pick_system_python
+    resolve_release
+    receipt_put release_tag "$TAG"
+    install_tool pipefy_cli
+    install_tool pipefy_mcp_server
+    install_skills
+    write_client_config
+    receipt_end
+    print_next_steps
+}
+
+main "$@"
